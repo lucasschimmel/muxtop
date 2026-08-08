@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Building a process's COMMAND column no longer allocates once per argument**
+  (`core`). `SystemSnapshot::collect` rendered argv with
+  `.map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")`,
+  which allocates one `String` per argument, plus the `Vec` holding them, plus
+  the joined result — then frees all but the last. That is `argc + 2`
+  allocations per process, for every process on the host, at the collector's
+  1 Hz. `to_string_lossy` already borrows whenever the bytes are valid UTF-8,
+  which every ordinary command line is, so the arguments are now pushed into
+  one pre-sized buffer and the cost is a single allocation regardless of
+  `argc`. Measured on a MacBook Air M3 with 400 processes averaging 5.5
+  arguments: **2 999 allocations per tick down to 400** — ~2 600 fewer per
+  second — and `SystemSnapshot::collect` improves by **2.0 %** (6.77 ms to
+  6.63 ms, p < 0.05). The rest of that time is sysinfo's own refresh, which
+  dominates the function.
+
+  The other three per-process strings — `name`, `user` and `status` — are
+  deliberately left alone. Each is a single allocation that `ProcessInfo` has
+  to own, and `status` in particular copies a `&'static str` onto the heap
+  every tick for want of anywhere else to put it. Removing those means changing
+  `ProcessInfo`'s field types, and those fields are on the wire: bincode encodes
+  a `String` as a length followed by its bytes, so swapping one for an enum or
+  an interned handle changes the byte sequence and breaks client/server
+  interop. Three allocations per process is not worth a wire break.
+
 - **The binary is 1.375 MiB smaller — 8.03 MiB to 6.66 MiB** (`deps`). rustls
   0.23 selects `aws-lc-rs` as its crypto provider by default, and
   `default-features = false` on `kube` — added in v0.4 to trim the feature set —
