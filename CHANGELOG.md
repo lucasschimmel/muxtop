@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The Apple GPU backend subscribes to 3 IOReport channels instead of 150**
+  (`core`). `IoReportSampler` copied the whole `Energy Model` group to read one
+  counter. The v0.7.0 notes guessed that group at "roughly eighty CPU
+  channels"; measured on an M3 it is **149**, one per power rail on the SoC.
+  The group cannot be narrowed with `IOReportCopyChannelsInGroup`'s subgroup
+  filter the way `GPU Stats` is — every `Energy Model` channel reports an empty
+  subgroup, so there is nothing to filter on — so the channel set is now
+  assembled directly from the two channels `decode` actually reads plus the
+  DVFS residency channel.
+
+  **The expected saving did not materialise, and is not claimed.** This was
+  picked as the most likely first megabyte of the Apple backend's footprint.
+  Measured A/B over five 30 s runs each, peak RSS is 12.41 MiB against 12.28
+  MiB and peak footprint 5.70 MiB against 5.56 MiB — both within run-to-run
+  spread, in the wrong direction if anything. Whatever the backend's ~1.5 MiB
+  of private footprint is, it is not these channels, and that remains open.
+
+  **What it does buy is CPU.** `decode` walks every channel of every delta and
+  converts each one's group name into an owned `String`, so the wide
+  subscription spent ~150 allocations and string comparisons per tick to find
+  two channels. `AppleEngine::snapshot` goes from **3.63 ms to 3.06 ms**
+  (median of 60 calls, −16 %) on an M3. It also drops a private symbol:
+  `IOReportMergeChannels` is no longer resolved, so one fewer undocumented
+  entry point has to survive a macOS release for the backend to start.
+
+  Behaviour is unchanged and verified against the running backend: power and
+  clock still read `—` on the first tick and real values afterwards
+  (0.42 W, 338 MHz), utilisation and memory come from the IORegistry and are
+  untouched, and temperature stays `—` as documented.
+
 - **Building a process's COMMAND column no longer allocates once per argument**
   (`core`). `SystemSnapshot::collect` rendered argv with
   `.map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")`,
