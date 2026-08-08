@@ -295,30 +295,42 @@ Everything the mouse can do, the keyboard can do. Overrides: `--theme <name>` (`
 
 ## Benchmarks
 
-Measured on a MacBook Air M3 (8 GB, macOS 26.5.1) with ~450 processes, via the
-Thomas benchmark. These are v0.7.0 figures: the numbers that stood here before
-were measured at **v0.3.1** and had gone four releases without being re-run, so
-they described a binary nobody was downloading any more.
+Measured on a MacBook Air M3 (8 GB, macOS 26.5.1) with ~430 processes, via the
+Thomas benchmark. Every figure is a median of five runs with its observed range
+beside it — a single sample of peak memory varies by more than a megabyte
+depending on how many processes are alive on the host.
 
-| Metric | Target | muxtop v0.7.0 |
-|----------|-------|--------|
-| Startup (`--about`) | < 100 ms | **12 ms** |
-| Binary size | < 10 MB | **8.0 MiB** (LTO + strip) |
-| FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) |
-| Peak RSS (30 s) | < 15 MiB | **12.4 MiB** — 9.9 MiB with `--no-gpu` |
+| Metric | Target | muxtop v0.8 | was (v0.7.0) |
+|----------|-------|--------|--------|
+| Startup (`--about`) | < 100 ms | **6.1 ms** (5.8–6.1) | 5.7 ms |
+| Binary size | < 10 MB | **6.66 MiB** (LTO + strip) | 8.03 MiB |
+| FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) | — |
+| Peak RSS (30 s) | < 15 MiB | **12.56 MiB** (12.4–12.8) | 12.55 MiB |
+| Peak footprint (30 s) | — | **5.66 MiB** (5.6–6.0) | 5.77 MiB |
 
-Both numbers that moved are attributed rather than guessed at:
+**Two memory numbers, because macOS reports two.** Peak RSS is what `top`
+shows, and it counts clean, shared, file-backed pages of the dyld shared cache
+— the text of every system library the process touched, shared with everything
+else running and never written. Physical footprint is what the kernel actually
+bills the process. On the same run they read 12.56 MiB and 5.66 MiB. RSS is the
+number comparable with htop (≈ 15) and btop (≈ 40); footprint is the half
+muxtop can actually reduce. Both are published rather than whichever flatters.
 
-- **The GPU tab is the entire memory difference.** The Apple Silicon backend
-  costs ~2.4 MiB resident. The dependency bumps since v0.6.0 cost nothing
-  measurable — v0.7.0 with `--no-gpu` lands on v0.6.0 to within run-to-run
-  noise, on the same machine.
-- **Binary size has been near 8 MiB since v0.4** brought in a Kubernetes
-  client. v0.7.0 added 49 KiB to it. The 5.3 MiB figure predates that tab.
+**The v0.7.0 column is also re-measured, not copied.** The figures this table
+carried at v0.7.0 — 12 ms startup, 12.4 MiB RSS — came from a benchmark that
+timed a single process spawn against a 6–19 ms stopwatch and reported peak RSS
+from one sample. Startup was never 12 ms; about half of that was the
+measurement. Nothing regressed between the two columns; the instrument was
+replaced.
 
-Both are targets for **v0.8**, which is an optimisation release rather than a
-feature one. Restating a budget you have drifted past is not the same as meeting
-it, and this table is where the drift became visible.
+**Binary size is the one figure that genuinely moved: −1.375 MiB.** rustls 0.23
+defaults to the `aws-lc-rs` crypto provider, and `default-features = false` on
+`kube` deselected the `ring` it would otherwise have used, so the binary
+carried 927 KiB of C and assembly — ML-DSA and ML-KEM among it — that no
+muxtop handshake can reach. Pinning `ring` explicitly drops `aws-lc-sys` from
+the dependency graph entirely. It costs post-quantum key exchange, which for a
+channel carrying system metrics with a lifetime of seconds is a trade this
+project is willing to make.
 
 Run the benchmark yourself:
 

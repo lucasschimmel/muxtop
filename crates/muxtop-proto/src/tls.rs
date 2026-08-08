@@ -232,7 +232,7 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-        tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+        tokio_rustls::rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

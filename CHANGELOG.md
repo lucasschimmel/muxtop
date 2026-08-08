@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **The binary is 1.375 MiB smaller — 8.03 MiB to 6.66 MiB** (`deps`). rustls
+  0.23 selects `aws-lc-rs` as its crypto provider by default, and
+  `default-features = false` on `kube` — added in v0.4 to trim the feature set —
+  silently deselected the `ring` that kube 0.99 would otherwise have chosen.
+  Cargo then unified `tokio-rustls`'s own `aws_lc_rs` default across the graph,
+  so the `rustls` shared by kube-client and hyper-rustls resolved to aws-lc.
+  Nothing in this workspace ever asked for it. The result was **927 KiB of C
+  and assembly** in the binary, 242 KiB of which is ML-DSA and ML-KEM —
+  post-quantum code that no muxtop handshake can reach, since no certificate
+  authority issues ML-DSA certificates. Pinning `ring` on both `kube` and
+  `tokio-rustls` removes `aws-lc-sys` from the dependency graph entirely.
+
+  **What it costs: post-quantum key exchange.** ring does not implement ML-KEM,
+  so a muxtop-server session no longer negotiates a hybrid key exchange. The
+  channel carries system metrics with a useful lifetime measured in seconds,
+  which makes harvest-now-decrypt-later a poor threat model to optimise for.
+  TLS 1.3 itself is unaffected. The secondary benefit is that `aws-lc-sys`
+  needs a C toolchain and cmake at build time, which the static musl build was
+  paying for.
+
+  **What it does not change: memory or startup.** Peak RSS is 12.56 MiB against
+  12.55 MiB before, and startup is unchanged within run-to-run spread. The code
+  removed was never paged in — it only executes during a TLS handshake, which
+  the benchmark does not perform. Binary size and resident memory are close to
+  independent here, and reporting the size win as a memory win would be wrong.
+
+### Fixed
+
+- **The benchmark was measuring itself** (`ci`). Two of the three figures
+  `scripts/bench-thomas.sh` published described the harness rather than the
+  binary.
+
+  Startup was timed by wrapping a *single* exec in two `date` calls, charging
+  the measurement for two process spawns. On a MacBook Air M3 two back-to-back
+  `date` calls with nothing between them cost 6–19 ms — and the script reported
+  ~12 ms for a binary that starts in 5.7 ms. About half of every published
+  startup figure was the stopwatch. That made the metric useless rather than
+  flattering: any change worth less than the noise floor was invisible, and
+  that is every change an optimisation release makes. Startup is now timed over
+  200 execs inside one window, and the harness's own per-exec share — 43 µs —
+  is printed beside the result instead of being left to trust.
+
+  Peak RSS on macOS is mach's `resident_size`, which counts clean, file-backed,
+  **shared** pages of the dyld shared cache: the text of every system library
+  the process touched, shared with every other process and never written by us.
+  On the same run it reads 12.56 MiB where `phys_footprint` — what the kernel
+  actually bills — reads 5.66 MiB. Both are now reported. RSS was deliberately
+  **not** replaced: swapping the metric would have dropped the headline number
+  by 7 MiB without saving a byte, and it is the only figure comparable with the
+  htop and btop numbers the README cites.
+
+  Every figure is now a median of five runs printed with its observed range.
+  Single samples of peak RSS vary by ±1.5 MiB depending on how many processes
+  are alive on the host — wider than most of the savings v0.8 is chasing.
+
+- **The published performance figures were wrong in both directions**
+  (`docs`). `docs/wiki/Performance.md` still carried v0.3.1's 5.3 MiB binary
+  and 11.3 MiB RSS, four releases after that binary stopped existing — the
+  README was corrected for v0.7.0 and the wiki was not. Both now carry
+  re-measured v0.8 figures, the machine they came from, and the ranges. The
+  contributor ceilings and the published budgets are also now shown in one
+  table with the relationship between them stated, since the two lived in
+  separate documents that each looked like the only one.
+
 ## [0.7.0] - 2026-08-08
 
 Feature release: the GPU tab on **Apple Silicon**. Utilisation and memory come
