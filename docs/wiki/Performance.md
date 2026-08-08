@@ -11,11 +11,11 @@ repository's own benchmark. Medians of five runs, ranges beside them:
 
 | Metric | Budget | Measured |
 |---|---|---|
-| Startup (`--about`) | < 100 ms | **6.1 ms** (5.8–6.1) |
+| Startup (`--about`) | < 100 ms | **6.04 ms** (6.0–6.2) |
 | Binary size | < 10 MiB | **6.66 MiB** (LTO + strip) |
 | FPS (TUI) | > 30 | ~60, event-driven — idle ≈ 0 redraws |
-| Peak RSS (30 s) | < 15 MiB | **12.56 MiB** (htop ≈ 15, btop ≈ 40) |
-| Peak footprint (30 s) | — | **5.66 MiB** |
+| Peak RSS (30 s) | < 15 MiB | **12.34 MiB** (htop ≈ 15, btop ≈ 40) |
+| Peak footprint (30 s) | — | **5.52 MiB** |
 
 ```sh
 just bench-thomas       # macro: build, size, startup, RSS + footprint

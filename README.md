@@ -302,11 +302,11 @@ depending on how many processes are alive on the host.
 
 | Metric | Target | muxtop v0.8 | was (v0.7.0) |
 |----------|-------|--------|--------|
-| Startup (`--about`) | < 100 ms | **6.1 ms** (5.8–6.1) | 5.7 ms |
+| Startup (`--about`) | < 100 ms | **6.04 ms** (6.0–6.2) | 5.67 ms |
 | Binary size | < 10 MB | **6.66 MiB** (LTO + strip) | 8.03 MiB |
 | FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) | — |
-| Peak RSS (30 s) | < 15 MiB | **12.56 MiB** (12.4–12.8) | 12.55 MiB |
-| Peak footprint (30 s) | — | **5.66 MiB** (5.6–6.0) | 5.77 MiB |
+| Peak RSS (30 s) | < 15 MiB | **12.34 MiB** (12.3–12.7) | 12.55 MiB |
+| Peak footprint (30 s) | — | **5.52 MiB** (5.5–5.8) | 5.77 MiB |
 
 **Two memory numbers, because macOS reports two.** Peak RSS is what `top`
 shows, and it counts clean, shared, file-backed pages of the dyld shared cache
