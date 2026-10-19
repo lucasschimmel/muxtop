@@ -18,8 +18,14 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+futures = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 dhat = "0.3"
 # k8s-openapi v1_32 needed by tests that touch muxtop_core::kube types

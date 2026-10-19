@@ -63,6 +63,7 @@ pub enum Action {
     ContainerStop,
     ContainerKill,
     ContainerRestart,
+    ContainerExec,
 
     // -- kubernetes --
     KubeSubview(KubeSubview),
@@ -83,6 +84,7 @@ impl Action {
                 | Action::ContainerStop
                 | Action::ContainerKill
                 | Action::ContainerRestart
+                | Action::ContainerExec
                 | Action::ToggleKubeScope
         )
     }
@@ -305,6 +307,17 @@ pub const BINDINGS: &[Binding] = &[
         "F11",
         "Restart container",
         false,
+        true
+    ),
+    b!(
+        KeyCode::Char('e'),
+        NONE,
+        Action::ContainerExec,
+        Scope::Tab(Tab::Containers),
+        Group::Actions,
+        "e",
+        "Open container shell (PTY)",
+        true,
         true
     ),
     // ---------------- tab-scoped: Kubernetes ----------------

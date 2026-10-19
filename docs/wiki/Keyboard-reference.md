@@ -20,7 +20,7 @@ the Kube sub-view to Deployments and the GPU sub-view to Devices; on any other
 tab it is unbound. Same key, different tab, different meaning, no ambiguity.
 
 **3. Actions that change the host are disabled over `--remote`.** Renice, kill,
-force-kill and the container stop/kill/restart actions are local-only. Remotely
+force-kill and the container stop/kill/restart/shell actions are local-only. Remotely
 they are rejected rather than silently ignored, so you get a message instead of
 wondering why nothing happened.
 
@@ -119,8 +119,11 @@ signal number to PID 1.
 | `F9` | Stop the container (SIGTERM + grace period) |
 | `F10` | Kill the container (SIGKILL) |
 | `F11` | Restart the container |
+| `e` | Open `/bin/sh` with a PTY (Linux/macOS, running containers) |
 
-All three ask for confirmation first, and all three are local-only.
+Stop/kill/restart ask for confirmation first. All container actions are local-only.
+Inside the shell, `Ctrl+]` detaches and `exit` returns normally; keys otherwise
+go to the shell. See [Containers](Containers#interactive-shell-linuxmacos-local-mode).
 
 ---
 

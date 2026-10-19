@@ -70,6 +70,7 @@ Key recipes:
 | `just dev` | Continuous clippy via bacon |
 | `just check` | Full CI check (fmt + clippy + deny + test) |
 | `just test` | Run the test suite |
+| `just test-exec-pty` | Native PTY lifecycle on Linux/macOS (Python 3 required) |
 | `just bench` | Run criterion benchmarks |
 | `just fmt` | Auto-format code |
 

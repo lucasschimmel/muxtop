@@ -45,6 +45,7 @@ struct CachedCpu {
 /// `bollard`-backed `ContainerEngine` implementation.
 pub struct DockerEngine {
     docker: Docker,
+    target: ConnectionTarget,
     kind: EngineKind,
     last_cpu: Mutex<HashMap<String, CachedCpu>>,
 }
@@ -72,6 +73,7 @@ impl DockerEngine {
         target: ConnectionTarget,
         allow_symlink: bool,
     ) -> Result<Self, EngineError> {
+        let exec_target = target.clone();
         let docker = match target {
             ConnectionTarget::Unix(path) => {
                 check_socket_symlink(&path, allow_symlink)?;
@@ -103,6 +105,7 @@ impl DockerEngine {
 
         Ok(Self {
             docker,
+            target: exec_target,
             kind,
             last_cpu: Mutex::new(HashMap::new()),
         })
@@ -261,6 +264,14 @@ impl ContainerEngine for DockerEngine {
     fn kind(&self) -> EngineKind {
         self.kind
     }
+
+    async fn exec_shell(
+        &self,
+        id: &str,
+        size: crate::container_exec::ExecSize,
+    ) -> Result<crate::container_exec::ExecSession, EngineError> {
+        crate::docker_exec::open_shell(self.docker.clone(), &self.target, id, size).await
+    }
 }
 
 // ─── helpers (pure, directly unit-tested) ──────────────────────────────────
@@ -300,7 +311,7 @@ fn check_socket_symlink(path: &std::path::Path, allow_symlink: bool) -> Result<(
 }
 
 /// Map a bollard error into our semantic [`EngineError`] enum.
-fn map_bollard_error(e: BollardError) -> EngineError {
+pub(crate) fn map_bollard_error(e: BollardError) -> EngineError {
     match &e {
         BollardError::DockerResponseServerError {
             status_code,

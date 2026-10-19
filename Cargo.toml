@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lucasschimmel/muxtop"
@@ -96,6 +96,12 @@ futures = "0.3"
 kube = { version = "~4.0.0", default-features = false, features = ["client", "ring", "rustls-tls"] }
 k8s-openapi = { version = "0.28" }
 
+# HTTP upgrade transport for raw exec PTYs (already resolved through bollard/kube).
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
 # HTTP types — used by KubeEngine metrics polling (request_text); already a
 # transitive dep via kube-client, declared explicitly here for clarity.
 http = "1"
@@ -120,9 +126,9 @@ rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.7.0" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.7.0" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.7.0" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.8.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.8.0" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.8.0" }
 
 [package]
 name = "muxtop"
