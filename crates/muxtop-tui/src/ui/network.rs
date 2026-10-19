@@ -45,7 +45,7 @@ pub fn draw_network_tab(frame: &mut Frame, area: Rect, r: &Render<'_>) {
         return;
     }
 
-    let interfaces = sorted_interfaces(r);
+    let interfaces = app.visible_interfaces();
     let filter_h = u16::from(app.filter_editing());
     // The graph needs a selected interface and enough vertical room to be worth
     // the space it costs.
@@ -111,9 +111,7 @@ fn sort_column(field: NetworkSortField) -> Option<usize> {
 }
 
 /// Filter + sort the interfaces exactly as the table shows them.
-fn sorted_interfaces(r: &Render<'_>) -> Vec<NetworkInterfaceSnapshot> {
-    let app = r.app;
-    let mut rows = app.visible_interfaces();
+pub(crate) fn sort_interfaces(app: &crate::app::AppState, rows: &mut [NetworkInterfaceSnapshot]) {
     let history = &app.network_history;
 
     match app.net_sort_field {
@@ -142,7 +140,6 @@ fn sorted_interfaces(r: &Render<'_>) -> Vec<NetworkInterfaceSnapshot> {
     if ascending != natural_ascending {
         rows.reverse();
     }
-    rows
 }
 
 fn interface_row(iface: &NetworkInterfaceSnapshot, r: &Render<'_>) -> Row {

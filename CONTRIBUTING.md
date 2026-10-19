@@ -172,7 +172,7 @@ enable one in their `[dependencies]`. The workaround is simple but **the CI
 command must include `--all-targets`** so dev-deps activate:
 
 ```sh
-cargo check --workspace --all-targets   # ✅ green — dev-deps enable v1_31
+cargo check --workspace --all-targets   # ✅ green — dev-deps enable v1_32
 cargo check --workspace                 # ❌ red on the muxtop-core lib build
 ```
 

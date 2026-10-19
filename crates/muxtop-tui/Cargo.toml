@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 muxtop-core = { workspace = true }
+muxtop-proto = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 nucleo = { workspace = true }
@@ -21,10 +22,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 dhat = "0.3"
-# k8s-openapi v1_31 needed by tests that touch muxtop_core::kube types
+# k8s-openapi v1_32 needed by tests that touch muxtop_core::kube types
 # (muxtop-core links against k8s-openapi without features per the
 # library guideline; binary tests resolve via dev-deps).
-k8s-openapi = { workspace = true, features = ["v1_31"] }
+k8s-openapi = { workspace = true, features = ["v1_32"] }
 
 [[bench]]
 name = "app_bench"

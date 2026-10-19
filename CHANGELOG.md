@@ -7,6 +7,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **The Apple GPU backend subscribes to 3 IOReport channels instead of 150**
+  (`core`). `IoReportSampler` copied the whole `Energy Model` group to read one
+  counter. The v0.7.0 notes guessed that group at "roughly eighty CPU
+  channels"; measured on an M3 it is **149**, one per power rail on the SoC.
+  The group cannot be narrowed with `IOReportCopyChannelsInGroup`'s subgroup
+  filter the way `GPU Stats` is — every `Energy Model` channel reports an empty
+  subgroup, so there is nothing to filter on — so the channel set is now
+  assembled directly from the two channels `decode` actually reads plus the
+  DVFS residency channel.
+
+  **The expected saving did not materialise, and is not claimed.** This was
+  picked as the most likely first megabyte of the Apple backend's footprint.
+  Measured A/B over five 30 s runs each, peak RSS is 12.41 MiB against 12.28
+  MiB and peak footprint 5.70 MiB against 5.56 MiB — both within run-to-run
+  spread, in the wrong direction if anything. Whatever the backend's ~1.5 MiB
+  of private footprint is, it is not these channels, and that remains open.
+
+  **What it does buy is CPU.** `decode` walks every channel of every delta and
+  converts each one's group name into an owned `String`, so the wide
+  subscription spent ~150 allocations and string comparisons per tick to find
+  two channels. `AppleEngine::snapshot` goes from **3.63 ms to 3.06 ms**
+  (median of 60 calls, −16 %) on an M3. It also drops a private symbol:
+  `IOReportMergeChannels` is no longer resolved, so one fewer undocumented
+  entry point has to survive a macOS release for the backend to start.
+
+  Behaviour is unchanged and verified against the running backend: power and
+  clock still read `—` on the first tick and real values afterwards
+  (0.42 W, 338 MHz), utilisation and memory come from the IORegistry and are
+  untouched, and temperature stays `—` as documented.
+
+- **Building a process's COMMAND column no longer allocates once per argument**
+  (`core`). `SystemSnapshot::collect` rendered argv with
+  `.map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")`,
+  which allocates one `String` per argument, plus the `Vec` holding them, plus
+  the joined result — then frees all but the last. That is `argc + 2`
+  allocations per process, for every process on the host, at the collector's
+  1 Hz. `to_string_lossy` already borrows whenever the bytes are valid UTF-8,
+  which every ordinary command line is, so the arguments are now pushed into
+  one pre-sized buffer and the cost is a single allocation regardless of
+  `argc`. Measured on a MacBook Air M3 with 400 processes averaging 5.5
+  arguments: **2 999 allocations per tick down to 400** — ~2 600 fewer per
+  second — and `SystemSnapshot::collect` improves by **2.0 %** (6.77 ms to
+  6.63 ms, p < 0.05). The rest of that time is sysinfo's own refresh, which
+  dominates the function.
+
+  The other three per-process strings — `name`, `user` and `status` — are
+  deliberately left alone. Each is a single allocation that `ProcessInfo` has
+  to own, and `status` in particular copies a `&'static str` onto the heap
+  every tick for want of anywhere else to put it. Removing those means changing
+  `ProcessInfo`'s field types, and those fields are on the wire: bincode encodes
+  a `String` as a length followed by its bytes, so swapping one for an enum or
+  an interned handle changes the byte sequence and breaks client/server
+  interop. Three allocations per process is not worth a wire break.
+
+- **The binary is 1.375 MiB smaller — 8.03 MiB to 6.66 MiB** (`deps`). rustls
+  0.23 selects `aws-lc-rs` as its crypto provider by default, and
+  `default-features = false` on `kube` — added in v0.4 to trim the feature set —
+  silently deselected the `ring` that kube 0.99 would otherwise have chosen.
+  Cargo then unified `tokio-rustls`'s own `aws_lc_rs` default across the graph,
+  so the `rustls` shared by kube-client and hyper-rustls resolved to aws-lc.
+  Nothing in this workspace ever asked for it. The result was **927 KiB of C
+  and assembly** in the binary, 242 KiB of which is ML-DSA and ML-KEM —
+  post-quantum code that no muxtop handshake can reach, since no certificate
+  authority issues ML-DSA certificates. Pinning `ring` on both `kube` and
+  `tokio-rustls` removes `aws-lc-sys` from the dependency graph entirely.
+
+  **What it costs: post-quantum key exchange.** ring does not implement ML-KEM,
+  so a muxtop-server session no longer negotiates a hybrid key exchange. The
+  channel carries system metrics with a useful lifetime measured in seconds,
+  which makes harvest-now-decrypt-later a poor threat model to optimise for.
+  TLS 1.3 itself is unaffected. The secondary benefit is that `aws-lc-sys`
+  needs a C toolchain and cmake at build time, which the static musl build was
+  paying for.
+
+  **What it does not change: memory or startup.** Peak RSS is 12.56 MiB against
+  12.55 MiB before, and startup is unchanged within run-to-run spread. The code
+  removed was never paged in — it only executes during a TLS handshake, which
+  the benchmark does not perform. Binary size and resident memory are close to
+  independent here, and reporting the size win as a memory win would be wrong.
+
+### Fixed
+
+- **Container CPU and uptime stay accurate across samples and restarts**
+  (`core`). CPU deltas retain the daemon's full container ID. Uptime uses
+  the actual start time, and remains unknown when inspect is unavailable.
+- **Kubernetes failures no longer leave cached resources looking fresh**
+  (`core`). Failed resource categories are cleared, expired collections are
+  reported stale, and replies from an earlier namespace scope are discarded.
+  Multi-file `KUBECONFIG` values are split using the platform separator and
+  merged with kube's configuration semantics.
+- **Inspectors and copy actions follow the displayed row** (`tui`). Network,
+  GPU and Kubernetes selection respects sorting and filtering; shrinking
+  snapshots clamp selections and scroll offsets. Deferred process filters
+  also finish while paused, and textual sorting targets the active subview.
+- **Remote availability remains visible through disconnect and recovery**
+  (`proto`, `tui`). Ordered connection events keep old samples stale until
+  a fresh sample arrives after reconnect. Silent sessions expire after three
+  heartbeat intervals. Server writes and handshakes are cancellable and
+  bounded; shutdown joins client tasks, and closing the collector receiver
+  stops its secondary loops.
+- **Diagnostic logs are bounded** (`cli`, `server`). A nonblocking worker
+  writes a single log segment capped at 2 MiB, and admission rejection counts
+  are aggregated instead of logging each rejected connection.
+
+- **The benchmark was measuring itself** (`ci`). Two of the three figures
+  `scripts/bench-thomas.sh` published described the harness rather than the
+  binary.
+
+  Startup was timed by wrapping a *single* exec in two `date` calls, charging
+  the measurement for two process spawns. On a MacBook Air M3 two back-to-back
+  `date` calls with nothing between them cost 6–19 ms — and the script reported
+  ~12 ms for a binary that starts in 5.7 ms. About half of every published
+  startup figure was the stopwatch. That made the metric useless rather than
+  flattering: any change worth less than the noise floor was invisible, and
+  that is every change an optimisation release makes. Startup is now timed over
+  200 execs inside one window, and the harness's own per-exec share — 43 µs —
+  is printed beside the result instead of being left to trust.
+
+  Peak RSS on macOS is mach's `resident_size`, which counts clean, file-backed,
+  **shared** pages of the dyld shared cache: the text of every system library
+  the process touched, shared with every other process and never written by us.
+  On the same run it reads 12.56 MiB where `phys_footprint` — what the kernel
+  actually bills — reads 5.66 MiB. Both are now reported. RSS was deliberately
+  **not** replaced: swapping the metric would have dropped the headline number
+  by 7 MiB without saving a byte, and it is the only figure comparable with the
+  htop and btop numbers the README cites.
+
+  Every figure is now a median of five runs printed with its observed range.
+  Single samples of peak RSS vary by ±1.5 MiB depending on how many processes
+  are alive on the host — wider than most of the savings v0.8 is chasing.
+
+- **The published performance figures were wrong in both directions**
+  (`docs`). `docs/wiki/Performance.md` still carried v0.3.1's 5.3 MiB binary
+  and 11.3 MiB RSS, four releases after that binary stopped existing — the
+  README was corrected for v0.7.0 and the wiki was not. Both now carry
+  re-measured v0.8 figures, the machine they came from, and the ranges. The
+  contributor ceilings and the published budgets are also now shown in one
+  table with the relationship between them stated, since the two lived in
+  separate documents that each looked like the only one.
+
+### Security
+
+- Update the lockfile to rustls 0.23.46 and rustls-webpki 0.103.15 while
+  retaining the explicit ring provider.
+- Migrate kube 0.99 to 4.0 and k8s-openapi 0.24 to 0.28, removing
+  `serde_yaml` and `unsafe-libyaml` from the dependency graph. `cargo deny`
+  passes without a new advisory exception. Disable kube's automatic retries
+  so the existing poll cadence and per-request deadlines continue to own
+  failure recovery.
+
+### Changed
+
+- Keep current Clippy builds compatible with Rust 1.88: use fixed-size slice
+  chunks for Apple DVFS decoding and require async-trait 0.1.92, which removes
+  a redundant generated `must_use` attribute flagged by newer Clippy.
+- Kubernetes bindings target **1.32**; test, docs and publishing feature
+  gates are updated together. Kubernetes timestamps now use jiff while
+  snapshot ages keep their existing semantics. Rust 1.88 remains the MSRV;
+  kube is constrained to 4.0.x because 4.2 requires Rust 1.89. The unused
+  kube runtime feature is removed.
+- The hidden `build_kube_snapshot_for_bench` helper now accepts the Pod type
+  from k8s-openapi 0.28. This changes the Rust type identity for consumers
+  of that helper and belongs in the planned minor release. Public snapshot
+  models and the remote wire format are unchanged.
+
 ## [0.7.0] - 2026-08-08
 
 Feature release: the GPU tab on **Apple Silicon**. Utilisation and memory come

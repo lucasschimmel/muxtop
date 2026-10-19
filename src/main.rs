@@ -173,7 +173,7 @@ struct Cli {
     bench_run: Option<u64>,
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let data_dir = dirs::data_local_dir()
@@ -183,11 +183,12 @@ fn init_tracing() -> Result<()> {
     std::fs::create_dir_all(&data_dir).context("failed to create muxtop data directory")?;
 
     let log_path = data_dir.join("muxtop.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .context("failed to open log file")?;
+    let log_file = muxtop_proto::logging::BoundedLog::open(&log_path)
+        .context("failed to open bounded log file")?;
+    let (log_writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(muxtop_proto::logging::LOG_QUEUE_LINES_LIMIT)
+        .lossy(true)
+        .finish(log_file);
 
     let env_filter =
         EnvFilter::try_from_env("MUXTOP_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -195,7 +196,7 @@ fn init_tracing() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             fmt::layer()
-                .with_writer(log_file)
+                .with_writer(log_writer)
                 .with_ansi(false)
                 .with_target(true)
                 .with_thread_ids(true),
@@ -203,7 +204,7 @@ fn init_tracing() -> Result<()> {
         .with(env_filter)
         .init();
 
-    Ok(())
+    Ok(guard)
 }
 
 fn main() -> Result<()> {
@@ -226,7 +227,7 @@ fn main() -> Result<()> {
 }
 
 async fn run_app(cli: Cli) -> Result<()> {
-    init_tracing()?;
+    let _log_guard = init_tracing()?;
 
     tracing::info!("muxtop starting");
 
@@ -317,6 +318,7 @@ async fn run_app(cli: Cli) -> Result<()> {
         None
     };
 
+    let (connection_tx, connection_rx) = mpsc::channel(8);
     let collector_handle = if let Some((_, addr, ref server_name)) = parsed_remote {
         // Token is mandatory for remote connections.
         let token: Token = if let Some(path) = cli.token_file.as_deref() {
@@ -358,7 +360,7 @@ async fn run_app(cli: Cli) -> Result<()> {
             tls_connector,
             server_name.clone(),
         );
-        remote.spawn(tx, None, cancel.clone())
+        remote.spawn_updates(connection_tx, cancel.clone())
     } else {
         let collector = Collector::with_all_engines(
             Duration::from_secs(cli.refresh),
@@ -414,7 +416,13 @@ async fn run_app(cli: Cli) -> Result<()> {
     // engine the collector is polling.
     let tui_cluster_engine = cluster_engine.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
-        muxtop_tui::run(rx, config, tui_engine, tui_cluster_engine)
+        muxtop_tui::run_with_connection_events(
+            rx,
+            config,
+            tui_engine,
+            tui_cluster_engine,
+            Some(connection_rx),
+        )
     })
     .await
     .context("TUI thread panicked")?;

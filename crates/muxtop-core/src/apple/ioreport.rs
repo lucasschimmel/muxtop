@@ -31,9 +31,13 @@ use core_foundation::array::CFArray;
 use core_foundation::base::TCFType;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
-use core_foundation_sys::base::{CFRelease, CFTypeRef};
+use core_foundation_sys::array::{
+    CFArrayAppendValue, CFArrayCreateMutable, CFArrayGetCount, kCFTypeArrayCallBacks,
+};
+use core_foundation_sys::base::{CFRelease, CFTypeRef, kCFAllocatorDefault};
 use core_foundation_sys::dictionary::{
-    CFDictionaryGetValue, CFDictionaryRef, CFMutableDictionaryRef,
+    CFDictionaryCreateMutable, CFDictionaryGetValue, CFDictionaryRef, CFDictionarySetValue,
+    CFMutableDictionaryRef, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
 use core_foundation_sys::string::CFStringRef;
 
@@ -53,6 +57,16 @@ const SUBGROUP_PERF_STATES: &str = "GPU Performance States";
 const CHANNEL_GPU_ENERGY: &str = "GPU Energy";
 /// Fallback energy channel, millijoules, present on older chips.
 const CHANNEL_GPU: &str = "GPU";
+
+/// The only channels of the `Energy Model` group this backend reads.
+///
+/// The group carries one channel per power rail on the SoC — 149 of them on an
+/// M3, almost all CPU clusters and their SRAM. Subscribing to the group copies
+/// every one of them into every sample.
+const WANTED_ENERGY_CHANNELS: [&str; 2] = [CHANNEL_GPU_ENERGY, CHANNEL_GPU];
+
+/// Key under which `IOReport` dictionaries carry their channel array.
+const KEY_CHANNELS: &str = "IOReportChannels";
 
 /// Shortest interval a delta is reported over.
 ///
@@ -174,10 +188,9 @@ impl IoReportSampler {
                     u64,
                 ) -> CFMutableDictionaryRef
             );
-            let merge_channels = symbol!(
-                b"IOReportMergeChannels\0",
-                unsafe extern "C" fn(CFMutableDictionaryRef, CFMutableDictionaryRef, CFTypeRef)
-            );
+            // `IOReportMergeChannels` is deliberately not resolved. The channel
+            // set is now assembled directly (see `select_channels`), so one
+            // fewer private symbol has to exist for the backend to start.
             let create_subscription = symbol!(
                 b"IOReportCreateSubscription\0",
                 unsafe extern "C" fn(
@@ -240,37 +253,49 @@ impl IoReportSampler {
                 ),
             };
 
-            // Two narrow subscriptions rather than one wide one: the GPU Stats
-            // group also carries latency histograms with hundreds of buckets,
-            // and filtering by subgroup keeps them out of every sample.
+            // The GPU Stats group is narrowed by subgroup, which keeps its
+            // latency histograms — hundreds of buckets — out of every sample.
+            // The Energy Model group cannot be narrowed the same way: its
+            // channels carry no subgroup at all, so `IOReportCopyChannelsInGroup`
+            // has nothing to filter on and returns all 149 of them. The channel
+            // set is therefore assembled here instead, and only what `decode`
+            // actually reads goes into it.
             let energy_group = CFString::new(GROUP_ENERGY);
             let gpu_group = CFString::new(GROUP_GPU_STATS);
             let perf_subgroup = CFString::new(SUBGROUP_PERF_STATES);
 
-            let channels = copy_channels(
+            let energy_all = copy_channels(
                 energy_group.as_concrete_TypeRef(),
                 std::ptr::null(),
                 0,
                 0,
                 0,
             );
-            if channels.is_null() {
+            if energy_all.is_null() {
                 return Err(GpuError::Query(format!(
                     "IOReport has no '{GROUP_ENERGY}' group on this host"
                 )));
             }
 
-            let perf_channels = copy_channels(
+            let perf_all = copy_channels(
                 gpu_group.as_concrete_TypeRef(),
                 perf_subgroup.as_concrete_TypeRef(),
                 0,
                 0,
                 0,
             );
-            if !perf_channels.is_null() {
-                merge_channels(channels, perf_channels, std::ptr::null());
-                CFRelease(perf_channels as CFTypeRef);
+
+            let channels = select_channels(energy_all, perf_all, symbols.channel_name);
+            CFRelease(energy_all as CFTypeRef);
+            if !perf_all.is_null() {
+                CFRelease(perf_all as CFTypeRef);
             }
+            let Some(channels) = channels else {
+                return Err(GpuError::Query(format!(
+                    "IOReport exposes no GPU channel in '{GROUP_ENERGY}' or \
+                     '{GROUP_GPU_STATS}/{SUBGROUP_PERF_STATES}' on this host"
+                )));
+            };
 
             // The out-parameter is the subscription's own view of the channel
             // set. It is deliberately not released: the ownership convention
@@ -434,6 +459,89 @@ impl Drop for IoReportSampler {
                 CFRelease(self.subscription as CFTypeRef);
             }
         }
+    }
+}
+
+/// Assemble the subscription's channel set from just the channels `decode`
+/// reads: the GPU energy counter, and the GPU's DVFS residency channel.
+///
+/// `IOReportCopyChannelsInGroup` can narrow a group by subgroup, which is how
+/// the GPU Stats group is trimmed to its performance states. That lever does
+/// not exist for the `Energy Model` group: every one of its channels reports an
+/// empty subgroup, so the call returns the whole group — 149 channels on an
+/// M3, one per power rail on the SoC, overwhelmingly CPU clusters and their
+/// SRAM. The subscription is therefore built here, and holds 3 channels rather
+/// than 150.
+///
+/// The gain is CPU, not memory. `decode` walks every channel in every delta
+/// and turns each one's group name into an owned `String`, so a wide
+/// subscription paid ~150 allocations and comparisons per tick to find two
+/// channels. Narrowing it takes `AppleEngine::snapshot` from 3.63 ms to
+/// 3.06 ms on an M3 (median of 60, −16 %). Peak RSS and physical footprint do
+/// **not** move measurably — that was the expected win and it did not
+/// materialise, so it is not claimed. Whatever the Apple backend's ~1.5 MiB of
+/// footprint is, it is not these channels.
+///
+/// Returns `None` when nothing matched, which is the honest signal that this
+/// host publishes neither counter under a name we know — the caller turns that
+/// into "no power or clock here" rather than subscribing to something useless.
+///
+/// # Safety
+/// `energy` must be a live channel dictionary; `perf` may be null. Neither is
+/// consumed — the caller still owns both and must release them. The returned
+/// dictionary follows the Create rule.
+unsafe fn select_channels(
+    energy: CFMutableDictionaryRef,
+    perf: CFMutableDictionaryRef,
+    channel_name: unsafe extern "C" fn(CFDictionaryRef) -> CFStringRef,
+) -> Option<CFMutableDictionaryRef> {
+    // SAFETY: the array retains every channel appended to it (it is created
+    // with the CF type callbacks), so the picked channels outlive the source
+    // dictionaries the caller releases immediately after this returns.
+    unsafe {
+        let key = CFString::new(KEY_CHANNELS);
+        let picked = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+
+        let append_matching = |source: CFMutableDictionaryRef, filter: bool| {
+            if source.is_null() {
+                return;
+            }
+            let raw = CFDictionaryGetValue(source as CFDictionaryRef, key.as_CFTypeRef().cast());
+            if raw.is_null() {
+                return;
+            }
+            let items: CFArray<CFDictionary> = CFArray::wrap_under_get_rule(raw.cast());
+            for item in items.iter() {
+                let channel = item.as_concrete_TypeRef();
+                let keep = !filter || {
+                    let name = cf_string(channel_name(channel));
+                    WANTED_ENERGY_CHANNELS.contains(&name.as_str())
+                };
+                if keep {
+                    CFArrayAppendValue(picked, channel.cast());
+                }
+            }
+        };
+
+        // The energy group is filtered by name; the performance-state subgroup
+        // is already exactly one channel and is taken whole.
+        append_matching(energy, true);
+        append_matching(perf, false);
+
+        if CFArrayGetCount(picked) == 0 {
+            CFRelease(picked as CFTypeRef);
+            return None;
+        }
+
+        let selected = CFDictionaryCreateMutable(
+            kCFAllocatorDefault,
+            0,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        CFDictionarySetValue(selected, key.as_CFTypeRef().cast(), picked.cast());
+        CFRelease(picked as CFTypeRef);
+        Some(selected)
     }
 }
 

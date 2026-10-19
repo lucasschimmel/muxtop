@@ -118,6 +118,16 @@ fn connection_spans(r: &Render<'_>) -> Vec<Span<'static>> {
                     .bg(theme.header_bg),
             ),
             Span::styled("read-only ", theme.subtle().bg(theme.header_bg)),
+            Span::styled(
+                format!("{} ", r.app.remote_status.label()),
+                theme
+                    .level_style(if r.app.remote_status == crate::RemoteStatus::Connected {
+                        crate::Level::Success
+                    } else {
+                        crate::Level::Warning
+                    })
+                    .bg(theme.header_bg),
+            ),
         ],
     }
 }

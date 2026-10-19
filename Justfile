@@ -20,12 +20,13 @@ run *ARGS:
 # Full CI check (fmt + clippy + deny + test)
 check:
     cargo fmt --all -- --check
-    cargo clippy --workspace -- -D warnings
-    cargo test --workspace
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo deny check
+    cargo test --workspace --locked
 
 # Run tests
 test:
-    cargo test --workspace
+    cargo test --workspace --locked
 
 # Format code
 fmt:
@@ -33,7 +34,7 @@ fmt:
 
 # Run clippy lints
 clippy:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Dev mode with bacon (continuous check)
 dev:
@@ -41,7 +42,7 @@ dev:
 
 # Run criterion micro-benchmarks
 bench:
-    cargo bench --workspace
+    cargo bench --workspace --locked
 
 # Run the Thomas macro-benchmark (build, startup, RSS)
 bench-thomas:

@@ -49,6 +49,34 @@ fn core_name(i: usize) -> String {
     table[i].clone()
 }
 
+/// Join a process's argv into the single string the COMMAND column renders.
+///
+/// The obvious spelling — `cmd().iter().map(|s| s.to_string_lossy()
+/// .into_owned()).collect::<Vec<_>>().join(" ")` — allocates one `String` per
+/// argument, plus the `Vec` holding them, plus the joined result, and then
+/// frees all but the last. That is `argc + 2` allocations per process per
+/// tick, and it ran for every process on the host at the collector's 1 Hz.
+///
+/// `to_string_lossy` returns a `Cow` that *borrows* whenever the bytes are
+/// already valid UTF-8, which is every ordinary command line, so pushing the
+/// borrowed slices into one pre-sized buffer leaves exactly one allocation
+/// regardless of `argc`. The capacity is a hint rather than an exact figure:
+/// invalid UTF-8 expands, since each malformed byte becomes a three-byte
+/// replacement character, and the buffer grows on those rare inputs.
+fn join_argv(argv: &[std::ffi::OsString]) -> String {
+    let Some((first, rest)) = argv.split_first() else {
+        return String::new();
+    };
+    let capacity = argv.iter().map(|arg| arg.len() + 1).sum::<usize>() - 1;
+    let mut joined = String::with_capacity(capacity);
+    joined.push_str(&first.to_string_lossy());
+    for arg in rest {
+        joined.push(' ');
+        joined.push_str(&arg.to_string_lossy());
+    }
+    joined
+}
+
 /// Per-core CPU snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct CoreSnapshot {
@@ -214,12 +242,7 @@ impl SystemSnapshot {
                     pid: pid.as_u32(),
                     parent_pid: proc_info.parent().map(|p| p.as_u32()),
                     name: proc_info.name().to_string_lossy().into_owned(),
-                    command: proc_info
-                        .cmd()
-                        .iter()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .collect::<Vec<_>>()
-                        .join(" "),
+                    command: join_argv(proc_info.cmd()),
                     user: proc_info
                         .user_id()
                         .map(|u| u.to_string())
@@ -270,6 +293,67 @@ impl SystemSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `join_argv` has to agree with the `Vec` + `join(" ")` it replaced for
+    /// every input, not just the common one — the point of the rewrite was to
+    /// drop `argc + 2` allocations per process per tick, and it is only worth
+    /// having if the rendered COMMAND column is byte-identical.
+    fn reference_join(argv: &[std::ffi::OsString]) -> String {
+        argv.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn os(parts: &[&str]) -> Vec<std::ffi::OsString> {
+        parts.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn join_argv_matches_the_allocating_join_it_replaced() {
+        for case in [
+            vec![],
+            os(&[""]),
+            os(&["ls"]),
+            os(&["ls", "-la"]),
+            os(&["/usr/bin/env", "python3", "-c", "print('hi there')"]),
+            os(&["", "", ""]),
+            os(&["arg with spaces", "another one"]),
+            os(&["héllo", "wörld", "→"]),
+        ] {
+            assert_eq!(join_argv(&case), reference_join(&case), "argv: {case:?}");
+        }
+    }
+
+    #[test]
+    fn join_argv_is_empty_for_empty_argv() {
+        assert_eq!(join_argv(&[]), "");
+    }
+
+    #[test]
+    fn join_argv_allocates_exactly_the_capacity_it_predicts_for_utf8() {
+        // The pre-sized buffer is the whole point: if the prediction were
+        // wrong the string would reallocate and the saving would be smaller
+        // than claimed. Valid UTF-8 must fit exactly.
+        let argv = os(&["/usr/bin/env", "python3", "-c", "print('hi')"]);
+        let joined = join_argv(&argv);
+        assert_eq!(joined.len(), joined.capacity());
+    }
+
+    /// Invalid UTF-8 is the one case the capacity hint under-counts, because
+    /// each malformed byte becomes a three-byte replacement character. The
+    /// buffer must grow rather than truncate or panic.
+    #[cfg(unix)]
+    #[test]
+    fn join_argv_survives_invalid_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let argv = vec![
+            std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            std::ffi::OsString::from("ok"),
+        ];
+        assert_eq!(join_argv(&argv), reference_join(&argv));
+        assert!(join_argv(&argv).ends_with(" ok"));
+    }
 
     #[test]
     fn test_snapshot_is_send_clone() {

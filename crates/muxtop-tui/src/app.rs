@@ -935,6 +935,7 @@ pub struct AppState {
     action_rx: tokio::sync::mpsc::UnboundedReceiver<(Level, String)>,
     /// Whether monitoring local machine or remote server.
     pub connection_mode: ConnectionMode,
+    pub remote_status: crate::RemoteStatus,
     /// Render-coalescing flag (PERF-H1). Set by any state-mutating handler;
     /// the main loop reads + clears it via `take_needs_redraw` each
     /// iteration. `Event::Tick` no longer triggers a draw on its own.
@@ -1020,6 +1021,7 @@ impl AppState {
             action_tx,
             action_rx,
             connection_mode: ConnectionMode::default(),
+            remote_status: crate::RemoteStatus::Waiting,
             // PERF-H1: start with one redraw scheduled so the first frame is
             // painted before any event arrives.
             needs_redraw: true,
@@ -1083,6 +1085,23 @@ impl AppState {
     /// Advance the animation counter (spinners). Cheap and wrapping.
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.flush_pending_filter();
+    }
+
+    /// Flush pending input on idle events, even while collection is paused.
+    pub(crate) fn flush_pending_filter(&mut self) {
+        self.flush_filter_at(Instant::now());
+    }
+
+    pub(crate) fn flush_filter_at(&mut self, now: Instant) {
+        if self
+            .last_filter_change
+            .is_some_and(|last| now.saturating_duration_since(last) >= FILTER_DEBOUNCE)
+        {
+            self.last_filter_change = None;
+            self.recompute_visible();
+            self.mark_dirty();
+        }
     }
 
     pub fn running(&self) -> bool {
@@ -1207,25 +1226,17 @@ impl AppState {
         let Some(snap) = self.last_snapshot.as_ref().and_then(|s| s.gpu.as_ref()) else {
             return 0;
         };
-        let f = self.gpu_filter_input.to_lowercase();
+        let filter = self.gpu_filter_input.to_lowercase();
         match self.gpu_subview {
             GpuSubview::Devices => snap
                 .devices
                 .iter()
-                .filter(|d| {
-                    f.is_empty()
-                        || d.name.to_lowercase().contains(&f)
-                        || d.vendor.label().contains(&f)
-                })
+                .filter(|d| crate::ui::gpu::device_matches_filter(d, &filter))
                 .count(),
             GpuSubview::Procs => snap
                 .processes
                 .iter()
-                .filter(|p| {
-                    f.is_empty()
-                        || p.name.to_lowercase().contains(&f)
-                        || p.pid.to_string().contains(&f)
-                })
+                .filter(|p| crate::ui::gpu::process_matches_filter(p, &filter))
                 .count(),
         }
     }
@@ -1521,8 +1532,34 @@ impl AppState {
         // PERF-03: same contract for the Kube tab — the cached view must
         // never outlive the snapshot it indexes into.
         self.recompute_kube_view();
+        self.clamp_view_selections();
         // PERF-H1: a fresh snapshot always changes what we'd paint.
         self.mark_dirty();
+    }
+
+    /// Snapshot replacement can shrink any list, including inactive tabs.
+    fn clamp_view_selections(&mut self) {
+        let counts = [
+            self.process_count(),
+            self.net_interface_count(),
+            self.containers_count(),
+            self.kube_count(),
+            self.gpu_count(),
+        ];
+        let positions = [
+            (&mut self.selected, &mut self.scroll_offset),
+            (&mut self.net_selected, &mut self.net_scroll_offset),
+            (
+                &mut self.containers_selected,
+                &mut self.containers_scroll_offset,
+            ),
+            (&mut self.kube_selected, &mut self.kube_scroll_offset),
+            (&mut self.gpu_selected, &mut self.gpu_scroll_offset),
+        ];
+        for ((selected, offset), count) in positions.into_iter().zip(counts) {
+            *selected = widgets::clamp_selection(*selected, count);
+            *offset = widgets::clamp_selection(*offset, count);
+        }
     }
 
     /// Per-container sparkline history cap — 60 samples, enough to fill the
@@ -2006,6 +2043,7 @@ impl AppState {
                 // First Esc leaves the input; the filter stays applied. A
                 // second Esc (handled by `go_back`) clears it.
                 self.set_filter_editing(false);
+                self.after_filter_change(true);
             }
             KeyCode::Enter => {
                 self.set_filter_editing(false);
@@ -2101,19 +2139,21 @@ impl AppState {
         }
     }
 
-    /// Network interfaces after the filter, in snapshot order.
+    /// Network interfaces in the same filtered and sorted order as the table.
     pub fn visible_interfaces(&self) -> Vec<muxtop_core::network::NetworkInterfaceSnapshot> {
         let Some(snapshot) = self.last_snapshot.as_ref() else {
             return Vec::new();
         };
         let filter = self.net_filter_input.to_lowercase();
-        snapshot
+        let mut rows: Vec<_> = snapshot
             .networks
             .interfaces
             .iter()
             .filter(|i| filter.is_empty() || i.name.to_lowercase().contains(&filter))
             .cloned()
-            .collect()
+            .collect();
+        crate::ui::network::sort_interfaces(self, &mut rows);
+        rows
     }
 
     /// Name of the selected Kubernetes object, whichever sub-view is active.
@@ -2137,20 +2177,12 @@ impl AppState {
     /// Identifier of the selected GPU row: the device's name, or the PID of
     /// the process holding VRAM.
     fn selected_gpu_name(&self) -> Option<String> {
-        let snap = self.last_snapshot.as_ref()?.gpu.as_ref()?;
-        let f = self.gpu_filter_input.to_lowercase();
         match self.gpu_subview {
-            GpuSubview::Devices => snap
-                .devices
-                .iter()
-                .filter(|d| f.is_empty() || d.name.to_lowercase().contains(&f))
-                .nth(self.gpu_selected)
+            GpuSubview::Devices => crate::ui::gpu::visible_devices(self)
+                .get(self.gpu_selected)
                 .map(|d| d.name.clone()),
-            GpuSubview::Procs => snap
-                .processes
-                .iter()
-                .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f))
-                .nth(self.gpu_selected)
+            GpuSubview::Procs => crate::ui::gpu::visible_procs(self)
+                .get(self.gpu_selected)
                 .map(|p| p.pid.to_string()),
         }
     }
@@ -2555,7 +2587,21 @@ impl AppState {
                 }
                 set.is_some()
             }
-            Tab::Kube => false,
+            Tab::Kube => {
+                let set = named_kube_sort(&f, self.kube_subview);
+                if let Some(sort) = set {
+                    self.kube_sort_field = sort;
+                    self.recompute_kube_view();
+                }
+                set.is_some()
+            }
+            Tab::Gpu => {
+                let set = named_gpu_sort(&f, self.gpu_subview);
+                if let Some(sort) = set {
+                    self.gpu_sort_field = sort;
+                }
+                set.is_some()
+            }
             _ => {
                 let set = match f.as_str() {
                     "cpu" => Some(SortField::Cpu),
@@ -2749,6 +2795,46 @@ impl AppState {
         // Keep the cursor inside the window we just scrolled to.
         *sel = (*sel).max(*off).min(count - 1);
     }
+}
+
+/// Resolve names only within the active sub-view's sortable columns.
+fn named_kube_sort(field: &str, view: KubeSubview) -> Option<KubeSortField> {
+    use KubeSortField::*;
+    Some(match (view, field) {
+        (KubeSubview::Pods, "name") => PodName,
+        (KubeSubview::Pods, "cpu") => PodCpu,
+        (KubeSubview::Pods, "mem" | "memory") => PodMem,
+        (KubeSubview::Pods, "restarts") => PodRestarts,
+        (KubeSubview::Pods, "age") => PodAge,
+        (KubeSubview::Pods, "phase" | "status") => PodPhase,
+        (KubeSubview::Nodes, "name") => NodeName,
+        (KubeSubview::Nodes, "cpu") => NodeCpuPct,
+        (KubeSubview::Nodes, "mem" | "memory") => NodeMemPct,
+        (KubeSubview::Nodes, "pods") => NodePodCount,
+        (KubeSubview::Nodes, "age") => NodeAge,
+        (KubeSubview::Deployments, "namespace" | "ns") => DeployNamespace,
+        (KubeSubview::Deployments, "name") => DeployName,
+        (KubeSubview::Deployments, "ready") => DeployReadyRatio,
+        (KubeSubview::Deployments, "age") => DeployAge,
+        _ => return None,
+    })
+}
+
+fn named_gpu_sort(field: &str, view: GpuSubview) -> Option<GpuSortField> {
+    use GpuSortField::*;
+    Some(match (view, field) {
+        (GpuSubview::Devices, "index") => DeviceIndex,
+        (GpuSubview::Devices, "name") => DeviceName,
+        (GpuSubview::Devices, "gpu" | "util" | "utilization") => DeviceUtil,
+        (GpuSubview::Devices, "mem" | "memory" | "vram") => DeviceMem,
+        (GpuSubview::Devices, "temp" | "temperature") => DeviceTemp,
+        (GpuSubview::Devices, "power") => DevicePower,
+        (GpuSubview::Procs, "pid") => ProcPid,
+        (GpuSubview::Procs, "name" | "command") => ProcName,
+        (GpuSubview::Procs, "mem" | "memory" | "vram") => ProcMem,
+        (GpuSubview::Procs, "device" | "index") => ProcDevice,
+        _ => return None,
+    })
 }
 
 /// Cycle to the next sort field.
@@ -5336,5 +5422,208 @@ mod tests {
             });
             assert!(found, "no palette command switches to the {tab} tab");
         }
+    }
+    // @generated by:gauntlet run:muxtop-audit-fixes
+    #[test]
+    fn audit_filter_escape_flushes_rapid_input_while_paused() {
+        let mut app = AppState::new();
+        app.apply_snapshot(make_snapshot(vec![make_process(1, "firefox", 1.0, 1)]));
+        app.paused = true;
+        app.filter_active = true;
+        app.handle_key_event(key(KeyCode::Char('f')));
+        app.handle_key_event(key(KeyCode::Char('z')));
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.visible_processes.is_empty());
+    }
+
+    #[test]
+    fn audit_gpu_sort_command_targets_active_view() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.switch_gpu_subview(GpuSubview::Procs);
+        app.apply_snapshot(snapshot_with_gpu(gpu_snapshot_with(1, 2)));
+        app.execute_invocation(Command::SortBy, Some("pid".into()));
+        assert_eq!(app.gpu_sort_field, GpuSortField::ProcPid);
+        assert_eq!(app.selected_identifier().as_deref(), Some("1001"));
+    }
+
+    #[test]
+    fn audit_snapshot_shrink_clamps_every_view() {
+        let mut app = AppState::new();
+        app.net_selected = 99;
+        app.net_scroll_offset = 99;
+        app.containers_selected = 99;
+        app.containers_scroll_offset = 99;
+        app.kube_selected = 99;
+        app.kube_scroll_offset = 99;
+        app.gpu_selected = 99;
+        app.gpu_scroll_offset = 99;
+        app.apply_snapshot(make_snapshot(vec![]));
+        assert_eq!((app.net_selected, app.net_scroll_offset), (0, 0));
+        assert_eq!(
+            (app.containers_selected, app.containers_scroll_offset),
+            (0, 0)
+        );
+        assert_eq!((app.kube_selected, app.kube_scroll_offset), (0, 0));
+        assert_eq!((app.gpu_selected, app.gpu_scroll_offset), (0, 0));
+    }
+
+    #[test]
+    fn audit_gpu_projection_sort_reverse_and_pid_filter() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.switch_gpu_subview(GpuSubview::Procs);
+        let mut gpu = gpu_snapshot_with(1, 2);
+        gpu.processes[0].mem_bytes = Some(1);
+        gpu.processes[1].mem_bytes = Some(100);
+        app.apply_snapshot(snapshot_with_gpu(gpu));
+        assert_eq!(app.selected_identifier().as_deref(), Some("1001"));
+        app.overlay = Overlay::Inspector;
+        let text =
+            crate::ui::test_support::all_text(&crate::ui::test_support::render_with(&app, 62, 24));
+        assert!(text.contains("worker1"));
+        assert!(!text.contains("worker0"));
+        app.reverse_sort();
+        assert_eq!(app.selected_identifier().as_deref(), Some("1000"));
+        app.set_filter("1001");
+        assert_eq!(app.gpu_count(), 1);
+        assert_eq!(app.selected_identifier().as_deref(), Some("1001"));
+        let text =
+            crate::ui::test_support::all_text(&crate::ui::test_support::render_with(&app, 62, 24));
+        assert!(text.contains("worker1"));
+        app.overlay = Overlay::None;
+        let text =
+            crate::ui::test_support::all_text(&crate::ui::test_support::render_with(&app, 100, 30));
+        assert!(text.contains("worker1"));
+        assert!(!text.contains("worker0"));
+    }
+    #[test]
+    fn audit_gpu_vendor_filter_reaches_table_inspector_and_copy() {
+        use crate::ui::test_support::{all_text, render_with};
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        app.apply_snapshot(snapshot_with_gpu(gpu_snapshot_with(1, 0)));
+        app.set_filter("NVIDIA");
+        assert_eq!(app.gpu_count(), 1);
+        assert_eq!(app.selected_identifier().as_deref(), Some("GPU 0"));
+        assert!(all_text(&render_with(&app, 100, 30)).contains("GPU 0"));
+        app.overlay = Overlay::Inspector;
+        assert!(all_text(&render_with(&app, 62, 24)).contains("GPU 0"));
+    }
+
+    #[test]
+    fn audit_kube_inspector_uses_sorted_projection() {
+        use crate::ui::test_support::{all_text, render_with};
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        app.apply_snapshot(snapshot_with_pods(&[
+            ("default", "alpha", 10),
+            ("default", "bravo", 500),
+        ]));
+        app.overlay = Overlay::Inspector;
+        let text = all_text(&render_with(&app, 62, 24));
+        assert!(text.contains("bravo"));
+        assert!(!text.contains("alpha"));
+        app.reverse_sort();
+        assert!(all_text(&render_with(&app, 62, 24)).contains("alpha"));
+        app.set_filter("bravo");
+        assert!(all_text(&render_with(&app, 62, 24)).contains("bravo"));
+    }
+
+    #[test]
+    fn audit_snapshot_shrink_keeps_remaining_rows_visible_on_inactive_tabs() {
+        let mut app = AppState::new();
+        let mut snap = snapshot_with_pods(&[("default", "remaining", 1)]);
+        snap.networks = crate::ui::test_support::snapshot().networks;
+        snap.networks.interfaces.truncate(1);
+        snap.gpu = Some(gpu_snapshot_with(1, 0));
+        app.selected = 2;
+        app.scroll_offset = 2;
+        app.net_selected = 2;
+        app.net_scroll_offset = 2;
+        app.containers_selected = 2;
+        app.containers_scroll_offset = 2;
+        app.kube_selected = 2;
+        app.kube_scroll_offset = 2;
+        app.gpu_selected = 2;
+        app.gpu_scroll_offset = 2;
+        app.apply_snapshot(snap);
+        for tab in [Tab::Network, Tab::Containers, Tab::Kube, Tab::Gpu] {
+            app.tab = tab;
+            assert!(
+                app.selected_identifier().is_some(),
+                "{tab:?} lost its remaining row"
+            );
+            let (selected, offset) = app.selected_mut();
+            assert_eq!((*selected, *offset), (0, 0));
+        }
+    }
+
+    #[test]
+    fn audit_filter_tick_applies_final_paused_input_after_deadline() {
+        let mut app = AppState::new();
+        app.apply_snapshot(make_snapshot(vec![make_process(1, "firefox", 1.0, 1)]));
+        app.paused = true;
+        app.filter_input = "no-match".into();
+        app.last_filter_change = Some(Instant::now() - FILTER_DEBOUNCE);
+        app.take_needs_redraw();
+        app.tick();
+        assert!(app.visible_processes.is_empty());
+        assert!(app.take_needs_redraw());
+    }
+    #[test]
+    fn audit_filter_deadline_uses_controlled_time() {
+        let mut app = AppState::new();
+        app.apply_snapshot(make_snapshot(vec![make_process(1, "firefox", 1.0, 1)]));
+        app.paused = true;
+        app.filter_input = "no-match".into();
+        let changed = Instant::now();
+        app.last_filter_change = Some(changed);
+        app.take_needs_redraw();
+        assert!(!crate::handle_idle_tick_at(
+            &mut app,
+            changed + FILTER_DEBOUNCE - Duration::from_nanos(1),
+        ));
+        assert_eq!(app.process_count(), 1);
+        assert!(crate::handle_idle_tick_at(
+            &mut app,
+            changed + FILTER_DEBOUNCE
+        ));
+        assert_eq!(app.process_count(), 0);
+        assert!(!crate::handle_idle_tick_at(
+            &mut app,
+            changed + FILTER_DEBOUNCE
+        ));
+    }
+
+    #[test]
+    fn audit_kube_text_sort_changes_the_visible_selection() {
+        let mut app = AppState::new();
+        app.tab = Tab::Kube;
+        app.apply_snapshot(snapshot_with_pods(&[
+            ("default", "zebra", 500),
+            ("default", "alpha", 10),
+        ]));
+        assert_eq!(app.selected_identifier().as_deref(), Some("zebra"));
+        app.execute_invocation(Command::SortBy, Some("name".into()));
+        assert_eq!(app.selected_identifier().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn audit_gpu_text_sort_rejects_columns_from_another_subview() {
+        let mut app = AppState::new();
+        app.tab = Tab::Gpu;
+        let original = app.gpu_sort_field;
+        app.execute_invocation(Command::SortBy, Some("pid".into()));
+        assert_eq!(app.gpu_sort_field, original);
+        assert!(matches!(app.sort_field, SortField::Cpu));
+        assert_eq!(app.notifier.latest().unwrap().level, Level::Warning);
+        assert!(
+            app.notifier
+                .latest()
+                .unwrap()
+                .text
+                .contains("not a sortable column")
+        );
     }
 }
