@@ -161,6 +161,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep current Clippy builds compatible with Rust 1.88: use fixed-size slice
+  chunks for Apple DVFS decoding and require async-trait 0.1.92, which removes
+  a redundant generated `must_use` attribute flagged by newer Clippy.
 - Kubernetes bindings target **1.32**; test, docs and publishing feature
   gates are updated together. Kubernetes timestamps now use jiff while
   snapshot ages keep their existing semantics. Rust 1.88 remains the MSRV;

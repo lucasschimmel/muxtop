@@ -54,7 +54,7 @@ pub fn parse_dvfs_table(blob: &[u8]) -> Option<DvfsTable> {
     }
 
     let mut table = Vec::with_capacity(blob.len() / DVFS_ENTRY_LEN);
-    for pair in blob.chunks_exact(DVFS_ENTRY_LEN) {
+    for pair in blob.as_chunks::<DVFS_ENTRY_LEN>().0 {
         let hz = u32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]);
         // Round to nearest rather than truncating: Apple's entries are exact
         // multiples of 1 MHz on every chip seen so far, but a 1 337.999 MHz

@@ -75,7 +75,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 bincode = "2"
 
 # Async trait (dyn-safe async fn in trait — see ADR-01 in forge/24)
-async-trait = "0.1"
+async-trait = "0.1.92"
 
 # Docker/Podman API client (v0.3 Containers, see ADR-01 in forge/25)
 bollard = "0.21"
