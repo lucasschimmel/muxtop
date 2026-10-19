@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-19
+
+Reliability, dependency maintenance and performance release. Docker/Kubernetes
+collection, TUI selection and remote reconnect/shutdown behavior are corrected;
+kube 4.0 removes the deprecated YAML dependency while retaining Rust 1.88.
+
+**Source API:** the hidden benchmark helper now uses k8s-openapi 0.28 Pods,
+which requires this minor bump. **Wire compatibility:** snapshot schemas and
+encoding are unchanged from v0.7.0; mixed v0.7/v0.8 client/server pairs retain
+the same protocol. Interactive `docker exec` with PTY remains deferred to a
+future release.
+
+The optimization measurements below were taken before the kube migration;
+final release measurements are in the [README](README.md#benchmarks) and
+[performance guide](docs/wiki/Performance.md). On 2026-10-19, five default
+Thomas runs on a MacBook Air M3 (8 GB, macOS 26.6.2, Rust 1.95.0, ~500
+processes) measured 5.85 ms startup (5.70–7.63), 12.98 MiB peak RSS
+(12.12–13.05) and 6.56 MiB footprint (6.34–6.72). The 7.97 MiB binary
+(8,355,168 bytes) meets the 10 MiB public budget but exceeds the unchanged
+7 MiB contributor ceiling. RSS is also close to its 13 MiB contributor ceiling;
+the highest sample exceeded it. These remain explicit release-review concerns,
+not relaxed budgets. The historical A/B figures below used a different OS and
+host load and do not establish a controlled comparison with this release.
+
 ### Performance
 
 - **The Apple GPU backend subscribes to 3 IOReport channels instead of 150**
@@ -171,7 +195,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kube runtime feature is removed.
 - The hidden `build_kube_snapshot_for_bench` helper now accepts the Pod type
   from k8s-openapi 0.28. This changes the Rust type identity for consumers
-  of that helper and belongs in the planned minor release. Public snapshot
+  of that helper and is accounted for by this minor release. Public snapshot
   models and the remote wire format are unchanged.
 
 ## [0.7.0] - 2026-08-08

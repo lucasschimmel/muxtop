@@ -6,22 +6,27 @@ aspirations — a feature that breaks one does not ship until it stops breaking 
 
 ## Published figures
 
-Measured on a MacBook Air M3 (8 GB, macOS 26.5.1) with ~430 processes, via the
-repository's own benchmark. Medians of five runs, ranges beside them:
+Measured for v0.8.0 on 2026-10-19 with Rust 1.95.0 on a MacBook Air M3
+(8 GB, macOS 26.6.2), with ~500 processes, via the repository's own benchmark.
+Timings and memory figures are medians of five runs, with ranges beside them:
 
 | Metric | Budget | Measured |
 |---|---|---|
-| Startup (`--about`) | < 100 ms | **6.04 ms** (6.0–6.2) |
-| Binary size | < 10 MiB | **6.66 MiB** (LTO + strip) |
+| Startup (`--about`) | < 100 ms | **5.85 ms** (5.70–7.63) |
+| Binary size | < 10 MiB | **7.97 MiB** (LTO + strip) |
 | FPS (TUI) | > 30 | ~60, event-driven — idle ≈ 0 redraws |
-| Peak RSS (30 s) | < 15 MiB | **12.34 MiB** (htop ≈ 15, btop ≈ 40) |
-| Peak footprint (30 s) | — | **5.52 MiB** |
+| Peak RSS (30 s) | < 15 MiB | **12.98 MiB** (12.12–13.05) |
+| Peak footprint (30 s) | — | **6.56 MiB** (6.34–6.72) |
 
 ```sh
 just bench-thomas       # macro: build, size, startup, RSS + footprint
 just bench              # criterion micro-benchmarks
 just bench-alloc        # dhat heap profile of the hot paths
 ```
+
+The headless macro does not measure interactive FPS; that row describes the
+nominal event-driven rendering cadence. RSS has only 0.02 MiB of median
+headroom against the contributor ceiling, with the highest sample at 13.05 MiB.
 
 Numbers move with hardware, process count and terminal. Reproduce them on your
 own box before comparing.
@@ -79,7 +84,8 @@ freezes its own tab's data, not your keyboard.
 
 **The release profile is tuned for size and speed**: `lto = "fat"`,
 `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`. That is what turns a
-multi-megabyte debug build into a 5.3 MiB static binary.
+debug build into a stripped release binary; the current measured size is in
+the table above.
 
 ---
 
@@ -178,8 +184,11 @@ measurement.
 
 **The `< 7 MiB` binary ceiling was written before muxtop had a Kubernetes
 client, and was exceeded from v0.4 to v0.7.** It was kept rather than restated
-upward, and v0.8 brought the binary back under it at 6.66 MiB. A budget you
-have drifted past is a debt, not a mistake in the budget.
+upward. The isolated crypto-provider optimization reached 6.66 MiB before
+the kube migration, but the final v0.8.0 release candidate measures **7.97 MiB**
+(8,355,168 bytes). It meets the public budget and exceeds the contributor
+ceiling by 0.97 MiB; release review must account for this outstanding debt.
+The ceiling remains unchanged.
 
 **Footprint is measured but not yet bounded.** v0.8 is the first release to
 report it, and one machine on one platform is not a baseline — a ceiling set

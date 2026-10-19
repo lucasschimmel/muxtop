@@ -1835,7 +1835,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "muxtop"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1881,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-proto"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bincode",
  "criterion",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-server"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "muxtop-tui"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "crossterm",

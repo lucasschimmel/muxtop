@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lucasschimmel/muxtop"
@@ -120,9 +120,9 @@ rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.7.0" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.7.0" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.7.0" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.8.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.8.0" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.8.0" }
 
 [package]
 name = "muxtop"
