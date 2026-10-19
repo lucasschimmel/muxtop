@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Timeout for TLS handshake with connecting clients.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 use muxtop_core::system::SystemSnapshot;
 use muxtop_proto::{Frame, WireMessage};
@@ -42,11 +43,22 @@ pub struct SharedState {
 /// Run the TCP+TLS server: relay collector snapshots to broadcast, accept clients.
 pub async fn run(
     config: ServerConfig,
-    mut collector_rx: mpsc::Receiver<SystemSnapshot>,
+    collector_rx: mpsc::Receiver<SystemSnapshot>,
     token: CancellationToken,
 ) -> Result<()> {
     let listener = TcpListener::bind(config.bind).await?;
-    tracing::info!(addr = %config.bind, "listening (TLS enabled)");
+    run_with_listener(config, listener, collector_rx, token).await
+}
+
+/// Run with an already-bound listener, also used by production-path integration tests.
+pub async fn run_with_listener(
+    config: ServerConfig,
+    listener: TcpListener,
+    mut collector_rx: mpsc::Receiver<SystemSnapshot>,
+    token: CancellationToken,
+) -> Result<()> {
+    let token = token.child_token();
+    tracing::info!(addr = %listener.local_addr()?, "listening (TLS enabled)");
 
     let tls_acceptor = config.tls_acceptor;
 
@@ -90,7 +102,7 @@ pub async fn run(
     // write bytes}.
     let relay_tx = broadcast_tx.clone();
     let relay_token = token.clone();
-    tokio::spawn(async move {
+    let relay = tokio::spawn(async move {
         loop {
             tokio::select! {
                 snapshot = collector_rx.recv() => {
@@ -125,23 +137,28 @@ pub async fn run(
         }
     });
 
+    let mut clients = tokio::task::JoinSet::new();
+    let mut rejected = 0u64;
+    let mut rejection_interval = tokio::time::interval(REJECTION_REPORT_INTERVAL);
+    rejection_interval.tick().await;
+    let mut accept_error = None;
     // Accept loop.
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (tcp_stream, peer) = result?;
+                let (tcp_stream, peer) = match result {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        accept_error = Some(error);
+                        break;
+                    }
+                };
 
                 // 1. Per-IP rate limiting: drop the TCP stream immediately
                 //    (no TLS handshake at all) if the source has exceeded
                 //    its token-bucket budget.
                 if !rate_limiter.try_admit(peer.ip()) {
-                    // `debug`, not `warn`: this fires once per refused
-                    // connection, and refusals arrive at flood rate by
-                    // definition. Warning here would let an attacker drive
-                    // our log volume — a bounded accept path feeding an
-                    // unbounded log. Operators who want the per-peer detail
-                    // can raise the level.
-                    tracing::debug!(peer = %peer, "rate-limited, dropping TCP stream");
+                    rejected = rejected.saturating_add(1);
                     drop(tcp_stream);
                     continue;
                 }
@@ -153,7 +170,7 @@ pub async fn run(
                 let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
-                        tracing::warn!(peer = %peer, "max clients reached, dropping TCP stream");
+                        rejected = rejected.saturating_add(1);
                         drop(tcp_stream);
                         continue;
                     }
@@ -166,14 +183,15 @@ pub async fn run(
                 let snapshot_rx = broadcast_tx.subscribe();
                 let client_token = token.clone();
 
-                tokio::spawn(async move {
+                clients.spawn(async move {
                     // TLS handshake (with timeout to prevent slowloris).
-                    let tls_stream = match tokio::time::timeout(
+                    let tls_stream = match tokio::select! {
+                        () = client_token.cancelled() => return,
+                        result = tokio::time::timeout(
                         TLS_HANDSHAKE_TIMEOUT,
                         tls_acceptor.accept(tcp_stream),
-                    )
-                    .await
-                    {
+                    ) => result,
+                    } {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
                             tracing::warn!(peer = %peer, error = %e, "TLS handshake failed");
@@ -197,6 +215,17 @@ pub async fn run(
                     tracing::info!(peer = %peer, "client disconnected");
                 });
             }
+            _ = rejection_interval.tick() => {
+                if rejected > 0 {
+                    tracing::warn!(rejected, "connections rejected by admission limits in the last interval");
+                    rejected = 0;
+                }
+            }
+            Some(result) = clients.join_next(), if !clients.is_empty() => {
+                if let Err(error) = result {
+                    tracing::error!(%error, "client task failed");
+                }
+            }
             _ = token.cancelled() => {
                 tracing::info!("server shutting down, stopping accept loop");
                 break;
@@ -204,6 +233,18 @@ pub async fn run(
         }
     }
 
+    token.cancel();
+    while let Some(result) = clients.join_next().await {
+        if let Err(error) = result {
+            tracing::error!(%error, "client task failed during shutdown");
+        }
+    }
+    if let Err(error) = relay.await {
+        tracing::error!(%error, "snapshot relay failed");
+    }
+    if let Some(error) = accept_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 

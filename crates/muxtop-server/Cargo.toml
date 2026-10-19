@@ -29,13 +29,14 @@ rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }
 time = "0.3"
-# k8s-openapi v1_31 feature is enabled here (binary leaf) so muxtop-core's
+# k8s-openapi v1_32 feature is enabled here (binary leaf) so muxtop-core's
 # typed Pod/Node/Deployment imports resolve. See Cargo.toml workspace dep.
-k8s-openapi = { workspace = true, features = ["v1_31"] }
+k8s-openapi = { workspace = true, features = ["v1_32"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 x509-parser = "0.18"

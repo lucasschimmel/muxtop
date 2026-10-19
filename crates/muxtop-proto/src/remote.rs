@@ -22,6 +22,16 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Timeout for the initial handshake (Hello/Welcome exchange).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum server keepalive gap, independent of the configured snapshot cadence.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const IDLE_TIMEOUT: Duration = HEARTBEAT_INTERVAL.saturating_mul(3);
+
+// Keep the public error enum stable while distinguishing a lost live session
+// from a TCP connection timeout when choosing the reconnect backoff.
+#[derive(Debug, thiserror::Error)]
+#[error("server stopped sending snapshots and heartbeats")]
+struct IdleTimeout;
+
 /// Connection event sent to the TUI for status display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
@@ -31,6 +41,64 @@ pub enum ConnectionEvent {
     Disconnected,
     /// Server sent an error (e.g. 401 unauthorized, 503 max clients).
     ServerError { code: u16, message: String },
+}
+
+/// Ordered local updates keep connection transitions and samples in one FIFO.
+// Keep snapshots inline, as in WireMessage, to avoid an allocation per sample.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum RemoteUpdate {
+    Connection(ConnectionEvent),
+    Snapshot(SystemSnapshot),
+}
+
+enum RemoteOutput {
+    Split {
+        tx: mpsc::Sender<SystemSnapshot>,
+        conn_tx: Option<mpsc::Sender<ConnectionEvent>>,
+    },
+    Ordered(mpsc::Sender<RemoteUpdate>),
+}
+
+impl RemoteOutput {
+    async fn closed(&self) {
+        match self {
+            Self::Split { tx, .. } => tx.closed().await,
+            Self::Ordered(tx) => tx.closed().await,
+        }
+    }
+
+    fn snapshot(&self, snapshot: SystemSnapshot) -> bool {
+        match self {
+            Self::Split { tx, .. } => !matches!(
+                tx.try_send(snapshot),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ),
+            Self::Ordered(tx) => !matches!(
+                tx.try_send(RemoteUpdate::Snapshot(snapshot)),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ),
+        }
+    }
+
+    async fn event(&self, event: ConnectionEvent, cancel: &CancellationToken) {
+        match self {
+            Self::Split {
+                conn_tx: Some(tx), ..
+            } => {
+                let _ = tx.try_send(event);
+            }
+            Self::Split { conn_tx: None, .. } => {}
+            Self::Ordered(tx) => {
+                // Never lose transitions behind dropped samples. Cancellation
+                // interrupts backpressure when the UI has stopped consuming.
+                tokio::select! {
+                    _ = cancel.cancelled() => {},
+                    _ = tx.send(RemoteUpdate::Connection(event)) => {},
+                }
+            }
+        }
+    }
 }
 
 /// A TLS client that connects to a muxtop-server and receives snapshots.
@@ -70,15 +138,19 @@ impl RemoteCollector {
         conn_tx: Option<mpsc::Sender<ConnectionEvent>>,
         cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(tx, conn_tx, cancel))
+        tokio::spawn(self.run(RemoteOutput::Split { tx, conn_tx }, cancel))
     }
 
-    async fn run(
+    /// Spawn with ordered connection events and snapshots for UI consumers.
+    pub fn spawn_updates(
         self,
-        tx: mpsc::Sender<SystemSnapshot>,
-        conn_tx: Option<mpsc::Sender<ConnectionEvent>>,
+        tx: mpsc::Sender<RemoteUpdate>,
         cancel: CancellationToken,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run(RemoteOutput::Ordered(tx), cancel))
+    }
+
+    async fn run(self, output: RemoteOutput, cancel: CancellationToken) {
         let mut backoff = INITIAL_BACKOFF;
 
         loop {
@@ -86,14 +158,14 @@ impl RemoteCollector {
                 break;
             }
 
-            match self.connect_and_stream(&tx, &conn_tx, &cancel).await {
+            match self.connect_and_stream(&output, &cancel).await {
                 Ok(()) => {
                     // Clean shutdown (cancel fired).
                     break;
                 }
                 Err(e) => {
                     tracing::warn!("remote connection error: {e}");
-                    Self::send_conn_event(&conn_tx, ConnectionEvent::Disconnected).await;
+                    output.event(ConnectionEvent::Disconnected, &cancel).await;
 
                     // Wait with exponential backoff, but respect cancellation.
                     tokio::select! {
@@ -104,7 +176,9 @@ impl RemoteCollector {
                     // G-01: Only grow backoff for consecutive failures.
                     // ConnectionClosed means we had a successful connection that dropped,
                     // so reset backoff for a fresh reconnection attempt.
-                    if matches!(e, RemoteError::ConnectionClosed) {
+                    let session_ended = matches!(&e, RemoteError::ConnectionClosed)
+                        || matches!(&e, RemoteError::Io(error) if error.get_ref().is_some_and(|cause| cause.is::<IdleTimeout>()));
+                    if session_ended {
                         backoff = INITIAL_BACKOFF;
                     } else {
                         backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -122,8 +196,7 @@ impl RemoteCollector {
     /// Returns `Err` on any connection/protocol error (caller will reconnect).
     async fn connect_and_stream(
         &self,
-        tx: &mpsc::Sender<SystemSnapshot>,
-        conn_tx: &Option<mpsc::Sender<ConnectionEvent>>,
+        output: &RemoteOutput,
         cancel: &CancellationToken,
     ) -> Result<(), RemoteError> {
         // Connect with cancellation support.
@@ -143,6 +216,20 @@ impl RemoteCollector {
         };
 
         let (reader, writer) = tokio::io::split(tls_stream);
+        self.stream_session(reader, writer, output, cancel).await
+    }
+
+    async fn stream_session<R, W>(
+        &self,
+        reader: R,
+        writer: W,
+        output: &RemoteOutput,
+        cancel: &CancellationToken,
+    ) -> Result<(), RemoteError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         let mut frame_reader = FrameReader::new(reader);
         let mut frame_writer = FrameWriter::new(writer);
 
@@ -154,17 +241,17 @@ impl RemoteCollector {
         let hello_frame = hello
             .to_frame()
             .map_err(|e| RemoteError::Protocol(e.to_string()))?;
-        frame_writer
-            .write_frame(&hello_frame)
-            .await
-            .map_err(|e| RemoteError::Protocol(e.to_string()))?;
-
-        // Read Welcome (with timeout).
-        let welcome_frame = timeout(HANDSHAKE_TIMEOUT, frame_reader.read_frame())
-            .await
-            .map_err(|_| RemoteError::HandshakeTimeout)?
-            .map_err(|e| RemoteError::Protocol(e.to_string()))?
-            .ok_or(RemoteError::ConnectionClosed)?;
+        let welcome_frame = tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            () = output.closed() => return Ok(()),
+            result = timeout(HANDSHAKE_TIMEOUT, async {
+                frame_writer.write_frame(&hello_frame).await
+                    .map_err(|e| RemoteError::Protocol(e.to_string()))?;
+                frame_reader.read_frame().await
+                    .map_err(|e| RemoteError::Protocol(e.to_string()))?
+                    .ok_or(RemoteError::ConnectionClosed)
+            }) => result.map_err(|_| RemoteError::HandshakeTimeout)??,
+        };
 
         let welcome_msg = WireMessage::from_frame(&welcome_frame)
             .map_err(|e| RemoteError::Protocol(e.to_string()))?;
@@ -172,14 +259,15 @@ impl RemoteCollector {
         let hostname = match welcome_msg {
             WireMessage::Welcome { hostname, .. } => hostname,
             WireMessage::Error { code, message } => {
-                Self::send_conn_event(
-                    conn_tx,
-                    ConnectionEvent::ServerError {
-                        code,
-                        message: message.clone(),
-                    },
-                )
-                .await;
+                output
+                    .event(
+                        ConnectionEvent::ServerError {
+                            code,
+                            message: message.clone(),
+                        },
+                        cancel,
+                    )
+                    .await;
                 return Err(RemoteError::ServerError { code, message });
             }
             other => {
@@ -190,17 +278,20 @@ impl RemoteCollector {
         };
 
         tracing::info!("connected to {hostname} at {}", self.addr);
-        Self::send_conn_event(conn_tx, ConnectionEvent::Connected { hostname }).await;
-
-        // Reset backoff on successful connection — caller handles this by restarting.
-        // But we can't mutate backoff here since it's in the caller scope.
-        // The caller resets backoff in the loop.
+        output
+            .event(ConnectionEvent::Connected { hostname }, cancel)
+            .await;
 
         // --- Streaming loop ---
         loop {
             tokio::select! {
-                frame_result = frame_reader.read_frame() => {
-                    let frame = match frame_result {
+                frame_result = timeout(IDLE_TIMEOUT, frame_reader.read_frame()) => {
+                    let frame = match frame_result.map_err(|_| {
+                        RemoteError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            IdleTimeout,
+                        ))
+                    })? {
                         Ok(Some(f)) => f,
                         Ok(None) => return Err(RemoteError::ConnectionClosed),
                         Err(e) => return Err(RemoteError::Protocol(e.to_string())),
@@ -211,15 +302,8 @@ impl RemoteCollector {
 
                     match msg {
                         WireMessage::Snapshot(snapshot) => {
-                            match tx.try_send(snapshot) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    tracing::trace!("channel full, dropping remote snapshot");
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    tracing::debug!("channel closed, stopping remote collector");
-                                    return Ok(());
-                                }
+                            if !output.snapshot(snapshot) {
+                                return Ok(());
                             }
                         }
                         WireMessage::Heartbeat { .. } => {
@@ -227,10 +311,7 @@ impl RemoteCollector {
                         }
                         WireMessage::Error { code, message } => {
                             tracing::error!("server error {code}: {message}");
-                            Self::send_conn_event(
-                                conn_tx,
-                                ConnectionEvent::ServerError { code, message: message.clone() },
-                            ).await;
+                            output.event(ConnectionEvent::ServerError { code, message: message.clone() }, cancel).await;
                             return Err(RemoteError::ServerError { code, message });
                         }
                         other => {
@@ -238,20 +319,12 @@ impl RemoteCollector {
                         }
                     }
                 }
+                () = output.closed() => return Ok(()),
                 () = cancel.cancelled() => {
                     tracing::debug!("remote collector cancelled");
                     return Ok(());
                 }
             }
-        }
-    }
-
-    async fn send_conn_event(
-        conn_tx: &Option<mpsc::Sender<ConnectionEvent>>,
-        event: ConnectionEvent,
-    ) {
-        if let Some(tx) = conn_tx {
-            let _ = tx.try_send(event);
         }
     }
 }
@@ -428,6 +501,226 @@ mod tests {
             gpu: None,
             timestamp_ms: 1_713_200_000_000,
         }
+    }
+
+    // @generated by:gauntlet run:muxtop-audit-fixes
+    #[tokio::test]
+    async fn t_ac_04_spawn_updates_reconnects_after_silence_and_receives_fresh_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = test_tls_acceptor();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let first = acceptor.accept(tcp).await.unwrap();
+            let (first_reader, first_writer) = tokio::io::split(first);
+            let mut first_reader = FrameReader::new(first_reader);
+            let mut first_writer = FrameWriter::new(first_writer);
+            let hello = first_reader.read_frame().await.unwrap().unwrap();
+            assert!(matches!(
+                WireMessage::from_frame(&hello).unwrap(),
+                WireMessage::Hello { .. }
+            ));
+            first_writer
+                .write_frame(
+                    &WireMessage::Welcome {
+                        server_version: "test".into(),
+                        hostname: "silent-host".into(),
+                        refresh_hz: 1,
+                    }
+                    .to_frame()
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Keep the first connection open and completely silent while
+            // accepting a genuine reconnect on the same listening socket.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let second = acceptor.accept(tcp).await.unwrap();
+            let (reader, writer) = tokio::io::split(second);
+            let mut reader = FrameReader::new(reader);
+            let mut writer = FrameWriter::new(writer);
+            let hello = reader.read_frame().await.unwrap().unwrap();
+            assert!(matches!(
+                WireMessage::from_frame(&hello).unwrap(),
+                WireMessage::Hello { .. }
+            ));
+            writer
+                .write_frame(
+                    &WireMessage::Welcome {
+                        server_version: "test".into(),
+                        hostname: "recovered-host".into(),
+                        refresh_hz: 1,
+                    }
+                    .to_frame()
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut snapshot = make_test_snapshot();
+            snapshot.timestamp_ms = 42;
+            writer
+                .write_frame(&WireMessage::Snapshot(snapshot).to_frame().unwrap())
+                .await
+                .unwrap();
+            server_cancel.cancelled().await;
+            // Both halves must stay alive until the test explicitly stops the server.
+            drop((first_reader, first_writer, reader, writer));
+        });
+        let (tx, mut updates) = mpsc::channel(8);
+        let collector = test_collector(addr, None).spawn_updates(tx, cancel.clone());
+        let connected = timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(connected, RemoteUpdate::Connection(ConnectionEvent::Connected { hostname }) if hostname == "silent-host")
+        );
+
+        // Advance only the quiet period and retry delay under controlled
+        // time. Resume before real socket/TLS I/O to avoid virtual-time
+        // handshake deadlines racing the operating system's readiness.
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        let disconnected = timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            disconnected,
+            RemoteUpdate::Connection(ConnectionEvent::Disconnected)
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(INITIAL_BACKOFF).await;
+        tokio::time::resume();
+
+        let reconnected = timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(reconnected, RemoteUpdate::Connection(ConnectionEvent::Connected { hostname }) if hostname == "recovered-host")
+        );
+        let snapshot = timeout(Duration::from_secs(3), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(snapshot, RemoteUpdate::Snapshot(snapshot) if snapshot.timestamp_ms == 42)
+        );
+        cancel.cancel();
+        timeout(Duration::from_secs(1), collector)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // @generated by:gauntlet run:muxtop-audit-fixes
+    #[tokio::test(start_paused = true)]
+    async fn t_ac_04_ordered_status_backpressure_is_cancellable() {
+        let (tx, _rx) = mpsc::channel(1);
+        let output = RemoteOutput::Ordered(tx);
+        assert!(output.snapshot(make_test_snapshot()));
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            output
+                .event(ConnectionEvent::Disconnected, &task_cancel)
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    async fn session_fixture() -> (
+        tokio::task::JoinHandle<Result<(), RemoteError>>,
+        FrameWriter<tokio::io::DuplexStream>,
+        CancellationToken,
+        mpsc::Receiver<SystemSnapshot>,
+    ) {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut server = FrameWriter::new(server);
+        server
+            .write_frame(
+                &WireMessage::Welcome {
+                    hostname: "test-host".into(),
+                    server_version: "test".into(),
+                    refresh_hz: 3600,
+                }
+                .to_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (reader, writer) = tokio::io::split(client);
+        let (tx, rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let collector = test_collector("127.0.0.1:1".parse().unwrap(), None);
+        let task = tokio::spawn(async move {
+            collector
+                .stream_session(
+                    reader,
+                    writer,
+                    &RemoteOutput::Split { tx, conn_tx: None },
+                    &task_cancel,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        (task, server, cancel, rx)
+    }
+
+    // @generated by:gauntlet run:muxtop-audit-fixes
+    #[tokio::test(start_paused = true)]
+    async fn t_ac_04_welcome_followed_by_silence_expires() {
+        let (task, _server, _cancel, _rx) = session_fixture().await;
+        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(RemoteError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    // @generated by:gauntlet run:muxtop-audit-fixes
+    #[tokio::test(start_paused = true)]
+    async fn t_ac_04_heartbeats_keep_slow_snapshot_session_live_and_snapshot_recovers() {
+        let (task, mut server, cancel, mut rx) = session_fixture().await;
+        for _ in 0..5 {
+            tokio::time::advance(HEARTBEAT_INTERVAL).await;
+            server
+                .write_frame(
+                    &WireMessage::Heartbeat {
+                        server_version: "test".into(),
+                        uptime_secs: 1,
+                    }
+                    .to_frame()
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+        }
+        server
+            .write_frame(
+                &WireMessage::Snapshot(make_test_snapshot())
+                    .to_frame()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().cpu.global_usage, 25.0);
+        cancel.cancel();
+        assert!(task.await.unwrap().is_ok());
     }
 
     #[tokio::test]

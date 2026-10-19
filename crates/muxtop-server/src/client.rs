@@ -7,15 +7,15 @@ use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use muxtop_proto::{Frame, FrameReader, FrameWriter, WireMessage};
+use muxtop_proto::{Frame, FrameReader, FrameWriter, WireMessage, remote::HEARTBEAT_INTERVAL};
 
 use crate::error::ServerError;
 use crate::server::SharedState;
 
-/// Heartbeat interval: send a keepalive if no snapshot was forwarded in 5 seconds.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Bound writes so slow readers cannot retain a session permit indefinitely.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Handshake timeout: client must send Hello within 5 seconds of connecting.
+/// Client must send Hello promptly after the TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pre-authentication payload cap (per ADR-30-2 / MED-S1).
@@ -62,11 +62,13 @@ where
     // `read_frame()` for snapshot reads (we don't currently read post-Welcome
     // anyway, so this is purely defense-in-depth for future protocol
     // additions).
-    let hello_frame = time::timeout(
+    let hello_frame = tokio::select! {
+        () = token.cancelled() => return Ok(()),
+        result = time::timeout(
         HANDSHAKE_TIMEOUT,
         frame_reader.read_frame_with_max_payload(PRE_AUTH_HELLO_MAX_PAYLOAD),
-    )
-    .await
+    ) => result,
+    }
     .map_err(|_| ServerError::HandshakeTimeout)?
     .map_err(ServerError::Proto)?
     .ok_or(ServerError::HandshakeTimeout)?;
@@ -88,7 +90,7 @@ where
                     code: 401,
                     message: "unauthorized".into(),
                 };
-                let _ = frame_writer.write_frame(&error_msg.to_frame()?).await;
+                write_frame(&mut frame_writer, &error_msg.to_frame()?, &token).await?;
                 return Err(ServerError::Unauthorized);
             }
         }
@@ -106,10 +108,7 @@ where
         hostname: state.hostname.clone(),
         refresh_hz: state.refresh_hz,
     };
-    frame_writer
-        .write_frame(&welcome.to_frame()?)
-        .await
-        .map_err(ServerError::Proto)?;
+    write_frame(&mut frame_writer, &welcome.to_frame()?, &token).await?;
 
     tracing::info!(peer = %peer, "handshake complete, streaming");
 
@@ -125,10 +124,7 @@ where
                     Ok(frame) => {
                         // PERF-L1: the relay task already encoded this snapshot
                         // into a `Frame`; we just write the cached bytes.
-                        frame_writer
-                            .write_frame(&frame)
-                            .await
-                            .map_err(ServerError::Proto)?;
+                        write_frame(&mut frame_writer, &frame, &token).await?;
                         // Reset heartbeat timer after sending a snapshot.
                         heartbeat_interval.reset();
                     }
@@ -147,10 +143,7 @@ where
                     server_version: state.server_version.clone(),
                     uptime_secs: uptime,
                 };
-                frame_writer
-                    .write_frame(&msg.to_frame()?)
-                    .await
-                    .map_err(ServerError::Proto)?;
+                write_frame(&mut frame_writer, &msg.to_frame()?, &token).await?;
                 tracing::debug!(peer = %peer, "heartbeat sent");
             }
             _ = token.cancelled() => {
@@ -161,6 +154,22 @@ where
     }
 
     Ok(())
+}
+
+/// Cancellation may leave a partial frame; callers close the session on any error.
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    frame: &Frame,
+    token: &CancellationToken,
+) -> Result<(), ServerError> {
+    tokio::select! {
+        biased;
+        () = token.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "session cancelled").into()),
+        result = time::timeout(WRITE_TIMEOUT, writer.write_frame(frame)) => {
+            result.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "frame write timed out"))??;
+            Ok(())
+        }
+    }
 }
 
 /// Constant-time byte comparison to prevent timing attacks on token validation.
@@ -182,6 +191,88 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn blocked_session() -> (
+        tokio::task::JoinHandle<Result<(), ServerError>>,
+        CancellationToken,
+        Arc<tokio::sync::Semaphore>,
+        tokio::io::DuplexStream,
+    ) {
+        let (server, mut peer) = tokio::io::duplex(256);
+        let hello = WireMessage::Hello {
+            client_version: "test".into(),
+            auth_token: Some("placeholder".into()),
+        };
+        FrameWriter::new(&mut peer)
+            .write_frame(&hello.to_frame().unwrap())
+            .await
+            .unwrap();
+        let (reader, writer) = tokio::io::split(server);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let state = Arc::new(SharedState {
+            auth_token: "placeholder".into(),
+            refresh_hz: 1,
+            hostname: "test".into(),
+            server_version: "test".into(),
+            start_time: std::time::Instant::now(),
+            semaphore: semaphore.clone(),
+        });
+        let (snapshots, rx) = broadcast::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(handle(
+            reader,
+            writer,
+            "127.0.0.1:1".parse().unwrap(),
+            state,
+            rx,
+            cancel.clone(),
+            permit,
+        ));
+        let welcome = FrameReader::new(&mut peer)
+            .read_frame()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            WireMessage::from_frame(&welcome).unwrap(),
+            WireMessage::Welcome { .. }
+        ));
+        snapshots
+            .send(Arc::new(Frame {
+                msg_type: muxtop_proto::MSG_SNAPSHOT,
+                payload: vec![0; 4096],
+            }))
+            .unwrap();
+        tokio::task::yield_now().await;
+        // Dropping the broadcast sender must not rescue a write blocked on the peer.
+        drop(snapshots);
+        (task, cancel, semaphore, peer)
+    }
+
+    // @generated by:gauntlet run:muxtop-audit-fixes
+    #[tokio::test(start_paused = true)]
+    async fn t_ac_04_blocked_snapshot_write_times_out_and_releases_permit() {
+        let (task, _cancel, semaphore, _peer) = blocked_session().await;
+        tokio::time::advance(WRITE_TIMEOUT + Duration::from_secs(1)).await;
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, ServerError::Io(ref e) if e.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    // @generated by:gauntlet run:muxtop-audit-fixes
+    #[tokio::test(start_paused = true)]
+    async fn t_ac_04_shutdown_interrupts_blocked_snapshot_write() {
+        let (task, cancel, semaphore, _peer) = blocked_session().await;
+        cancel.cancel();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, ServerError::Io(ref e) if e.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert_eq!(semaphore.available_permits(), 1);
+    }
 
     #[test]
     fn test_constant_time_eq_equal() {

@@ -46,12 +46,13 @@ core-foundation-sys = { workspace = true }
 libloading = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 tempfile = "3"
-# k8s-openapi v1_31 feature is enabled here so unit/integration tests have
+# k8s-openapi v1_32 feature is enabled here so unit/integration tests have
 # the typed API objects available; the library itself (above) declares no
 # version feature per k8s-openapi's library guideline.
-k8s-openapi = { workspace = true, features = ["v1_31"] }
+k8s-openapi = { workspace = true, features = ["v1_32"] }
 
 [[bench]]
 name = "process_bench"

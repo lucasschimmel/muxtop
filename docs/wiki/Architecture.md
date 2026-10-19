@@ -146,20 +146,28 @@ reference implementation.
 
 ## The k8s-openapi feature gate
 
+The workspace uses kube 4.0.x with k8s-openapi 0.28 and the Kubernetes 1.32
+bindings. kube 4.0 removes the deprecated YAML parser while retaining our
+Rust 1.88 MSRV; kube 4.2 requires Rust 1.89. The engine uses direct polling,
+so kube's runtime feature is disabled. kube's built-in request retries are
+also disabled: our poll cadence owns retries, and `LIST_TIMEOUT` bounds
+each resource, metrics and version request. Generated timestamps use jiff;
+only digested scalar ages enter our unchanged snapshot models.
+
 The one build wrinkle every contributor hits:
 
 ```sh
-cargo check --workspace --all-targets   # ✅ dev-deps enable v1_31
+cargo check --workspace --all-targets   # ✅ dev-deps enable v1_32
 cargo check --workspace                 # ❌ fails on the muxtop-core lib build
 ```
 
 `k8s-openapi` refuses to compile a library crate without a `v1_*` feature, and
 equally refuses to let library crates enable one in `[dependencies]`. So only the
-leaf binaries and `muxtop-core`'s dev-dependencies enable `v1_31`, and
+leaf binaries and `muxtop-core`'s dev-dependencies enable `v1_32`, and
 `--all-targets` is what activates them.
 
 Where dev-dependencies are not available — `cargo publish`, `cargo doc`,
-`cargo-semver-checks` — the `K8S_OPENAPI_ENABLED_VERSION=1.31` environment
+`cargo-semver-checks` — the `K8S_OPENAPI_ENABLED_VERSION=1.32` environment
 variable is the documented escape hatch, and the workflows set it. `just check`
 wraps the correct invocation.
 

@@ -213,7 +213,7 @@ fn container_row(c: &ContainerSnapshot, now_ms: u64, r: &Render<'_>) -> Row {
             Cell::new(dash.clone())
         },
         if running {
-            Cell::new(uptime(c.started_at_ms, now_ms))
+            Cell::new(uptime(c.started_at_ms, now_ms).unwrap_or_else(|| dash.clone()))
         } else {
             Cell::new(dash)
         },
@@ -221,11 +221,13 @@ fn container_row(c: &ContainerSnapshot, now_ms: u64, r: &Render<'_>) -> Row {
 }
 
 /// Compact uptime from a start timestamp.
-fn uptime(started_at_ms: u64, now_ms: u64) -> String {
-    if started_at_ms == 0 || now_ms <= started_at_ms {
-        return "0s".to_string();
+fn uptime(started_at_ms: u64, now_ms: u64) -> Option<String> {
+    if started_at_ms == 0 {
+        return None;
     }
-    super::inspector::format_age((now_ms - started_at_ms) / 1000)
+    Some(super::inspector::format_age(
+        now_ms.saturating_sub(started_at_ms) / 1000,
+    ))
 }
 
 fn draw_summary(frame: &mut Frame, area: Rect, r: &Render<'_>, cs: &ContainersSnapshot) {
@@ -405,9 +407,12 @@ mod tests {
 
     #[test]
     fn uptime_is_compact() {
-        assert_eq!(uptime(0, 1000), "0s");
-        assert_eq!(uptime(2000, 1000), "0s");
-        assert_eq!(uptime(0, 0), "0s");
-        assert_eq!(uptime(1_000_000, 1_000_000 + 7200 * 1000), "2h");
+        assert_eq!(uptime(0, 1000), None);
+        assert_eq!(uptime(2000, 1000).as_deref(), Some("0s"));
+        assert_eq!(uptime(0, 0), None);
+        assert_eq!(
+            uptime(1_000_000, 1_000_000 + 7200 * 1000).as_deref(),
+            Some("2h")
+        );
     }
 }

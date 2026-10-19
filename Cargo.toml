@@ -85,14 +85,16 @@ futures = "0.3"
 # trimmed to keep binary footprint controlled (see plan T-810/T-820).
 # k8s-openapi forbids library crates from enabling its v1_* features; only
 # the leaf binaries (muxtop, muxtop-server) and the muxtop-core dev-deps
-# enable `v1_31`. The library lines below intentionally carry no features.
+# enable `v1_32`. The library lines below intentionally carry no features.
 #
 # `ring` is listed explicitly because `default-features = false` drops it:
-# kube 0.99's defaults are `client, ring, rustls-tls, config`, so turning
+# kube 4's defaults are `client, rustls-tls, ring`, so turning
 # defaults off to trim the feature set also silently deselected the crypto
 # provider — see the `tokio-rustls` note below for what filled the gap.
-kube = { version = "0.99", default-features = false, features = ["client", "ring", "rustls-tls", "runtime"] }
-k8s-openapi = { version = "0.24" }
+# Stay on kube 4.0.x: 4.2 requires Rust 1.89, above our MSRV.
+# No runtime feature: this engine polls directly via Api, without reflectors.
+kube = { version = "~4.0.0", default-features = false, features = ["client", "ring", "rustls-tls"] }
+k8s-openapi = { version = "0.28" }
 
 # HTTP types — used by KubeEngine metrics polling (request_text); already a
 # transitive dep via kube-client, declared explicitly here for clarity.
@@ -160,8 +162,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 dirs = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-# k8s-openapi v1_31 feature is enabled here (binary leaf) so muxtop-core's
+# k8s-openapi v1_32 feature is enabled here (binary leaf) so muxtop-core's
 # typed Pod/Node/Deployment imports resolve. See workspace dep.
-k8s-openapi = { workspace = true, features = ["v1_31"] }
+k8s-openapi = { workspace = true, features = ["v1_32"] }

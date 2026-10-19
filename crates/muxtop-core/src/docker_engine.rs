@@ -12,7 +12,7 @@
 //! acceptable 2 s warm-up.
 
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -188,8 +188,13 @@ impl ContainerEngine for DockerEngine {
                             .id
                             .clone()
                             .ok_or_else(|| EngineError::Other("container has no id".into()))?;
-                        let stats = fetch_stats(&docker, &id).await?;
-                        Ok(build_snapshot(container, &stats, prev))
+                        let (stats, started_at_ms) = tokio::join!(
+                            fetch_stats(&docker, &id),
+                            fetch_started_at(&docker, &id),
+                        );
+                        let (mut snapshot, cpu) = build_snapshot(container, &stats?, prev);
+                        snapshot.started_at_ms = started_at_ms;
+                        Ok((snapshot, cpu))
                     }
                 })
                 .buffer_unordered(PARALLEL_STATS)
@@ -202,7 +207,7 @@ impl ContainerEngine for DockerEngine {
         for result in results {
             match result {
                 Ok((snap, cached)) => {
-                    new_cache.insert(snap.id.clone(), cached);
+                    new_cache.insert(snap.id_full.clone(), cached);
                     snapshots.push(snap);
                 }
                 // Raced with removal: drop silently.
@@ -471,17 +476,9 @@ fn build_snapshot(
             .unwrap_or(0),
     };
 
-    // Docker reports `created` as Unix seconds; convert to ms and fallback to now.
-    let started_at_ms = summary
-        .created
-        .filter(|c| *c > 0)
-        .map(|s| (s as u64).saturating_mul(1_000))
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        });
+    // The summary only contains creation time. A real start time is filled
+    // by the inspect request; zero honestly represents unavailable uptime.
+    let started_at_ms = 0;
 
     let snap = ContainerSnapshot {
         id: short_id,
@@ -501,6 +498,28 @@ fn build_snapshot(
     };
 
     (snap, cpu_cache)
+}
+
+/// Inspect each collection so a restart refreshes uptime immediately. Inspect
+/// failures must not discard otherwise usable stats (restricted Docker proxies).
+async fn fetch_started_at(docker: &Docker, id: &str) -> u64 {
+    let inspect = match timeout(STATS_TIMEOUT, docker.inspect_container(id, None)).await {
+        Ok(Ok(inspect)) => inspect,
+        Ok(Err(error)) => {
+            tracing::debug!(%id, %error, "container start time unavailable");
+            return 0;
+        }
+        Err(_) => {
+            tracing::debug!(%id, "container start time timed out");
+            return 0;
+        }
+    };
+    inspect
+        .state
+        .and_then(|state| state.started_at)
+        .and_then(|start| start.parse::<k8s_openapi::jiff::Timestamp>().ok())
+        .and_then(|start| u64::try_from(start.as_millisecond()).ok())
+        .unwrap_or(0)
 }
 
 /// One-shot stats fetch: `stream=false`, bounded by [`STATS_TIMEOUT`].
@@ -865,7 +884,7 @@ mod tests {
         assert_eq!(snap.net_tx_bytes, 500_000);
         assert_eq!(snap.block_read_bytes, 1024);
         assert_eq!(snap.block_write_bytes, 0);
-        assert_eq!(snap.started_at_ms, 1_700_000_000_000);
+        assert_eq!(snap.started_at_ms, 0);
         assert_eq!(cache.cpu_usage, 2_000);
         assert_eq!(cache.system_usage, 10_000);
     }
@@ -963,7 +982,7 @@ mod tests {
         for result in results {
             match result {
                 Ok((snap, cached)) => {
-                    new_cache.insert(snap.id.clone(), cached);
+                    new_cache.insert(snap.id_full.clone(), cached);
                     snapshots.push(snap);
                 }
                 Err(EngineError::ContainerNotFound(_)) => {}
@@ -991,3 +1010,8 @@ mod tests {
         // Don't assert count — test environment may have 0+ containers.
     }
 }
+
+#[cfg(test)]
+mod regression_tests;
+#[cfg(test)]
+pub(crate) mod test_support;

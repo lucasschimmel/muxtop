@@ -241,7 +241,7 @@ fn write_fingerprint_file(path: &Path, fingerprint: &str) -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let data_dir = dirs::data_local_dir()
@@ -251,11 +251,12 @@ fn init_tracing() -> Result<()> {
     std::fs::create_dir_all(&data_dir).context("failed to create muxtop data directory")?;
 
     let log_path = data_dir.join("muxtop-server.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .context("failed to open log file")?;
+    let log_file = muxtop_proto::logging::BoundedLog::open(&log_path)
+        .context("failed to open bounded log file")?;
+    let (log_writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(muxtop_proto::logging::LOG_QUEUE_LINES_LIMIT)
+        .lossy(true)
+        .finish(log_file);
 
     let env_filter =
         EnvFilter::try_from_env("MUXTOP_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
@@ -263,7 +264,7 @@ fn init_tracing() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             fmt::layer()
-                .with_writer(log_file)
+                .with_writer(log_writer)
                 .with_ansi(false)
                 .with_target(true)
                 .with_thread_ids(true),
@@ -271,14 +272,14 @@ fn init_tracing() -> Result<()> {
         .with(env_filter)
         .init();
 
-    Ok(())
+    Ok(guard)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    init_tracing()?;
+    let _log_guard = init_tracing()?;
 
     // Mandatory authentication: token is required (minimum 16 characters).
     // --token and --token-file are mutually exclusive (enforced via clap's

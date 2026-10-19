@@ -2,7 +2,7 @@
 //! auto-detection for Docker/Podman daemons.
 //!
 //! This module defines the interface only. The concrete `bollard`-based
-//! implementation lives in `DockerEngine` (E2, not yet implemented).
+//! implementation lives in `DockerEngine`.
 //!
 //! Refresh rate contract: the Collector is expected to invoke
 //! [`ContainerEngine::list_and_stats`] at **0.5 Hz** (once every 2 s, see

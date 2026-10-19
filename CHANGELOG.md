@@ -91,6 +91,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Container CPU and uptime stay accurate across samples and restarts**
+  (`core`). CPU deltas retain the daemon's full container ID. Uptime uses
+  the actual start time, and remains unknown when inspect is unavailable.
+- **Kubernetes failures no longer leave cached resources looking fresh**
+  (`core`). Failed resource categories are cleared, expired collections are
+  reported stale, and replies from an earlier namespace scope are discarded.
+  Multi-file `KUBECONFIG` values are split using the platform separator and
+  merged with kube's configuration semantics.
+- **Inspectors and copy actions follow the displayed row** (`tui`). Network,
+  GPU and Kubernetes selection respects sorting and filtering; shrinking
+  snapshots clamp selections and scroll offsets. Deferred process filters
+  also finish while paused, and textual sorting targets the active subview.
+- **Remote availability remains visible through disconnect and recovery**
+  (`proto`, `tui`). Ordered connection events keep old samples stale until
+  a fresh sample arrives after reconnect. Silent sessions expire after three
+  heartbeat intervals. Server writes and handshakes are cancellable and
+  bounded; shutdown joins client tasks, and closing the collector receiver
+  stops its secondary loops.
+- **Diagnostic logs are bounded** (`cli`, `server`). A nonblocking worker
+  writes a single log segment capped at 2 MiB, and admission rejection counts
+  are aggregated instead of logging each rejected connection.
+
 - **The benchmark was measuring itself** (`ci`). Two of the three figures
   `scripts/bench-thomas.sh` published described the harness rather than the
   binary.
@@ -126,6 +148,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contributor ceilings and the published budgets are also now shown in one
   table with the relationship between them stated, since the two lived in
   separate documents that each looked like the only one.
+
+### Security
+
+- Update the lockfile to rustls 0.23.46 and rustls-webpki 0.103.15 while
+  retaining the explicit ring provider.
+- Migrate kube 0.99 to 4.0 and k8s-openapi 0.24 to 0.28, removing
+  `serde_yaml` and `unsafe-libyaml` from the dependency graph. `cargo deny`
+  passes without a new advisory exception. Disable kube's automatic retries
+  so the existing poll cadence and per-request deadlines continue to own
+  failure recovery.
+
+### Changed
+
+- Kubernetes bindings target **1.32**; test, docs and publishing feature
+  gates are updated together. Kubernetes timestamps now use jiff while
+  snapshot ages keep their existing semantics. Rust 1.88 remains the MSRV;
+  kube is constrained to 4.0.x because 4.2 requires Rust 1.89. The unused
+  kube runtime feature is removed.
+- The hidden `build_kube_snapshot_for_bench` helper now accepts the Pod type
+  from k8s-openapi 0.28. This changes the Rust type identity for consumers
+  of that helper and belongs in the planned minor release. Public snapshot
+  models and the remote wire format are unchanged.
 
 ## [0.7.0] - 2026-08-08
 

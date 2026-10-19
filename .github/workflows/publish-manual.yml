@@ -24,9 +24,9 @@ env:
   # but `cargo publish` does not activate dev-deps during its verification
   # build. The k8s-openapi build script honours K8S_OPENAPI_ENABLED_VERSION
   # as the documented escape hatch for this exact case. Pin to the version
-  # the workspace targets (matches the v1_31 feature on dev-deps + leaf
+  # the workspace targets (matches the v1_32 feature on dev-deps + leaf
   # binaries, see Cargo.toml).
-  K8S_OPENAPI_ENABLED_VERSION: "1.31"
+  K8S_OPENAPI_ENABLED_VERSION: "1.32"
 
 jobs:
   publish:
