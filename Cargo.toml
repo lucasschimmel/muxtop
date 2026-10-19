@@ -35,7 +35,7 @@ nvml-wrapper = "0.12"
 # still starts on a macOS release that has moved them.
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-libloading = "0.8"
+libloading = "0.9"
 
 # TUI
 ratatui = "0.30"
