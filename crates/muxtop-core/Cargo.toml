@@ -24,6 +24,10 @@ dirs = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 serde_json = { workspace = true }
 
 # NVML has no macOS build (NVIDIA dropped Apple after Kepler), so the NVIDIA

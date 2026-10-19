@@ -96,6 +96,18 @@ pub trait ContainerEngine: Send + Sync {
     /// Restart the container.
     async fn restart(&self, id: &str) -> Result<(), EngineError>;
 
+    /// Attach `/bin/sh` with a daemon-side PTY, using the container's default user.
+    /// Existing third-party engines can explicitly decline interactive exec.
+    async fn exec_shell(
+        &self,
+        _id: &str,
+        _size: crate::container_exec::ExecSize,
+    ) -> Result<crate::container_exec::ExecSession, EngineError> {
+        Err(EngineError::Other(
+            "interactive exec is not supported by this engine".into(),
+        ))
+    }
+
     /// Reported engine kind (useful to drive the UI badge).
     fn kind(&self) -> EngineKind;
 }

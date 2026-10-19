@@ -166,6 +166,7 @@ pub enum Command {
     StopContainer,
     KillContainer,
     RestartContainer,
+    ExecContainer,
     SwitchToKube,
     SwitchToGpu,
     // -- added in 0.5.1: everything the keymap can do is reachable here too --
@@ -230,6 +231,7 @@ impl Command {
         Command::StopContainer,
         Command::KillContainer,
         Command::RestartContainer,
+        Command::ExecContainer,
         Command::SwitchToKube,
         Command::SwitchToGpu,
         Command::ShowHelp,
@@ -300,6 +302,7 @@ impl Command {
             | Command::StopContainer
             | Command::KillContainer
             | Command::RestartContainer
+            | Command::ExecContainer
             | Command::StopNamed
             | Command::RestartNamed => Some(Tab::Containers),
             Command::KubePods
@@ -344,6 +347,7 @@ impl Command {
             Command::StopContainer => "Stop container (SIGTERM)",
             Command::KillContainer => "Kill container (SIGKILL)",
             Command::RestartContainer => "Restart container",
+            Command::ExecContainer => "Open container shell (PTY)",
             Command::SwitchToKube => "Switch to Kubernetes tab",
             Command::SwitchToGpu => "Switch to GPU tab",
             Command::ShowHelp => "Help — keyboard reference",
@@ -400,6 +404,7 @@ impl Command {
             Command::StopContainer => "F9",
             Command::KillContainer => "F10",
             Command::RestartContainer => "F11",
+            Command::ExecContainer => "e",
             Command::SwitchToKube => "Alt+5",
             Command::SwitchToGpu => "Alt+6",
             Command::ShowHelp => "?",
@@ -428,7 +433,12 @@ impl Command {
     /// debug logs); the hot palette filter path uses [`Command::search_texts`]
     /// to avoid the per-keystroke allocation cost.
     fn search_text(self) -> String {
-        format!("{} {}", self.label(), self.shortcut())
+        let aliases = if self == Command::ExecContainer {
+            " exec docker podman"
+        } else {
+            ""
+        };
+        format!("{} {}{aliases}", self.label(), self.shortcut())
     }
 
     /// Pre-built haystack for every command in [`Command::ALL`], indexed by
@@ -920,6 +930,8 @@ pub struct AppState {
     /// Shared (cheaply cloneable `Arc`) between AppState and the Collector's
     /// container loop. `None` means container actions surface a "not
     /// configured" status message rather than spawning a task.
+    /// Full daemon ID of the shell request consumed exclusively by the TUI loop.
+    pub(crate) pending_exec: Option<String>,
     pub container_engine:
         Option<std::sync::Arc<dyn muxtop_core::container_engine::ContainerEngine + Send + Sync>>,
     /// Local-mode cluster engine, shared with the Collector. `None` in remote
@@ -1017,6 +1029,7 @@ impl AppState {
             container_rx_hist: std::collections::HashMap::new(),
             sorted_filtered_containers_cache: Vec::new(),
             container_engine: None,
+            pending_exec: None,
             cluster_engine: None,
             action_tx,
             action_rx,
@@ -1439,6 +1452,46 @@ impl AppState {
         }
     }
 
+    /// Queue a local shell against the visible row, never its shortened ID.
+    pub fn request_container_exec(&mut self) {
+        if self.is_remote() {
+            self.notify(Level::Warning, "Actions are disabled in remote mode");
+            return;
+        }
+        if !cfg!(unix) {
+            self.notify(Level::Warning, "Interactive exec requires Linux or macOS");
+            return;
+        }
+        if self.tab != Tab::Containers {
+            self.notify(
+                Level::Warning,
+                "Select a running container on the Containers tab first",
+            );
+            return;
+        }
+        let Some(container) = self.selected_container() else {
+            self.notify(Level::Warning, "Select a running container first");
+            return;
+        };
+        if container.state != muxtop_core::containers::ContainerState::Running {
+            self.notify(
+                Level::Warning,
+                "Interactive exec requires a running container",
+            );
+            return;
+        }
+        if self.container_engine.is_none() {
+            self.notify(Level::Error, "No container engine is configured");
+            return;
+        }
+        self.pending_exec = Some(container.id_full);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn exec_cancellation(&self) -> CancellationToken {
+        self.shutdown_token.clone()
+    }
+
     /// F9 — graceful stop (SIGTERM + grace).
     pub fn request_container_stop(&mut self) {
         self.request_container_action(|id, name| ConfirmAction::StopContainer { id, name });
@@ -1849,6 +1902,7 @@ impl AppState {
             Action::ContainerStop => self.request_container_stop(),
             Action::ContainerKill => self.request_container_kill(),
             Action::ContainerRestart => self.request_container_restart(),
+            Action::ContainerExec => self.request_container_exec(),
 
             // -- kubernetes --
             Action::KubeSubview(sv) => self.switch_kube_subview(sv),
@@ -2391,6 +2445,7 @@ impl AppState {
         Command::StopContainer,
         Command::KillContainer,
         Command::RestartContainer,
+        Command::ExecContainer,
         Command::StopNamed,
         Command::RestartNamed,
         Command::KubeToggleScope,
@@ -2699,6 +2754,7 @@ impl AppState {
             Command::StopContainer => self.request_container_stop(),
             Command::KillContainer => self.request_container_kill(),
             Command::RestartContainer => self.request_container_restart(),
+            Command::ExecContainer => self.request_container_exec(),
             Command::ShowHelp => self.open_overlay(Overlay::Help),
             Command::TogglePause => self.dispatch(Action::TogglePause),
             Command::RefreshNow => self.dispatch(Action::Refresh),

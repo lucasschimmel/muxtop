@@ -2,6 +2,10 @@ pub mod app;
 pub mod clipboard;
 pub mod error;
 pub mod event;
+#[cfg(any(unix, test))]
+mod exec;
+#[cfg(unix)]
+mod exec_tty;
 pub mod keymap;
 pub mod notify;
 pub mod terminal;
@@ -233,6 +237,35 @@ pub fn run_with_connection_events(
             Event::Tick => {
                 should_draw |= handle_idle_tick_at(&mut app, std::time::Instant::now());
             }
+        }
+
+        #[cfg(unix)]
+        if let Some(id) = app.pending_exec.take()
+            && let Some(engine) = app.container_engine.clone()
+        {
+            let cancel = app.exec_cancellation();
+            let result = guard.with_shell(|| exec::run(engine.as_ref(), &id, cancel))?;
+            let (level, message) = match result {
+                Ok(exec::Outcome::Detached) => (
+                    Level::Info,
+                    "Shell detached; the process may still be running".into(),
+                ),
+                Ok(exec::Outcome::Exited(Some(0))) => {
+                    (Level::Info, "Container shell exited (0)".into())
+                }
+                Ok(exec::Outcome::Exited(Some(code))) => {
+                    (Level::Warning, format!("Container shell exited ({code})"))
+                }
+                Ok(exec::Outcome::Exited(None)) => (
+                    Level::Warning,
+                    "Container shell disconnected; exit status unknown".into(),
+                ),
+                Err(error) => (Level::Error, format!("Container shell: {error}")),
+            };
+            app.notify(level, message);
+            let size = guard.terminal.size()?;
+            app.term_caps.set_size(size.width, size.height);
+            should_draw = true;
         }
 
         if should_draw {

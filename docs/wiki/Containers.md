@@ -61,10 +61,11 @@ every remote client.
 
 ## What it reads
 
-Two endpoints, both read-only:
+Monitoring reads these endpoints (exec is described separately below):
 
 - `GET /containers/json` — the list, names, images, state
 - `GET /containers/{id}/stats?stream=false` — one stats sample per cycle
+- `GET /containers/{id}/json` — actual start time, including restarts
 
 Container stats are collected at **0.5 Hz** — every two seconds — independently
 of the 1 Hz process loop. Container stats are the most expensive thing muxtop
@@ -86,6 +87,36 @@ All three ask for confirmation, naming the container, and all three are
 
 `x` opens the same actions as a menu, and the command palette reaches them by
 name: `:stop nginx`, `:restart postgres`.
+
+## Interactive shell (Linux/macOS, local mode)
+
+Select a **running** container and press `e`, choose **Open container shell (PTY)**
+from `x`, or find the same action in `Ctrl+P`. Selection follows the displayed
+sort/filter and uses the full container ID.
+
+muxtop suspends its interface and attaches `/bin/sh` with a Docker/Podman PTY via
+its existing daemon connection. No Docker/Podman CLI is required. The shell uses
+the container's default user and working directory, without privileged exec.
+`TERM` comes from muxtop's environment (fallback `xterm-256color`).
+
+- Wait for the shell prompt before typing: queued input is discarded when
+  entering and leaving the attachment so it cannot replay as muxtop shortcuts.
+- `Ctrl+C`, `Ctrl+D`, arrows, UTF-8 and other input pass to the shell as raw bytes.
+- `exit` or shell EOF returns to muxtop and reports the exit status when available.
+- `Ctrl+]` closes the attachment and returns to muxtop. It consumes typeahead in
+  the same input chunk. **Detaching does not guarantee termination** of the shell
+  or any jobs it started; use `exit` for a normal shell shutdown.
+- Resizing the terminal resizes the PTY (checked every 100 ms).
+- Setup and stalled writes have ten-second deadlines. Errors restore the TUI;
+  muxtop never retries shell startup automatically.
+
+Both stdin and stdout must be terminals. Windows and `--remote` do not offer an
+interactive session. Stopped/paused containers are refused. Images without
+`/bin/sh` (including distroless images) report a daemon error; muxtop does not
+install a shell or substitute a different command.
+
+Shell output is a direct terminal stream, including escape sequences, as with
+`docker exec -it`. It is not passed through the monitoring table's text sanitizer.
 
 ---
 
@@ -127,7 +158,6 @@ For detail, check `~/.local/share/muxtop/muxtop.log`, or run with
 
 ## Not implemented
 
-- **Interactive `docker exec`** with a PTY is scheduled for **v0.8**.
 - **Logs** (`docker logs`) are not shown — use `docker logs` for now.
 - **Creating, deleting or scaling** containers is out of scope. muxtop stops,
   kills and restarts what already exists; it is a monitor, not an orchestrator.

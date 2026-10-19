@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-19
+
+Reliability, dependency maintenance and performance release. Docker/Kubernetes
+collection, TUI selection and remote reconnect/shutdown behavior are corrected;
+kube 4.0 removes the deprecated YAML dependency while retaining Rust 1.88.
+
+**Source API:** the hidden benchmark helper now uses k8s-openapi 0.28 Pods,
+which requires this minor bump. **Wire compatibility:** snapshot schemas and
+encoding are unchanged from v0.7.0; mixed v0.7/v0.8 client/server pairs retain
+the same protocol. Interactive `docker exec` uses a local daemon attachment,
+separate from the monitoring protocol.
+
+The optimization measurements below were taken before the kube migration;
+final release validation and measurements are recorded separately.
+
+### Added
+
+- **Interactive container shell with a PTY** (`core`, `tui`). Press `e` on a
+  running container, or choose the shell action from `x` / `Ctrl+P`, to attach
+  `/bin/sh` through the existing Docker/Podman daemon connection. Linux/macOS
+  local mode only, without a Docker CLI dependency or privileged exec. Raw input
+  (including Ctrl+C), terminal resize, bounded writes and shell exit status are
+  supported. `exit` returns to muxtop; `Ctrl+]` closes the attachment without
+  promising to terminate the remote process. Errors restore the TUI. Remote
+  monitoring and snapshot/wire layouts are unchanged.
+
 ### Performance
 
 - **The Apple GPU backend subscribes to 3 IOReport channels instead of 150**
@@ -171,7 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kube runtime feature is removed.
 - The hidden `build_kube_snapshot_for_bench` helper now accepts the Pod type
   from k8s-openapi 0.28. This changes the Rust type identity for consumers
-  of that helper and belongs in the planned minor release. Public snapshot
+  of that helper and is accounted for by this minor release. Public snapshot
   models and the remote wire format are unchanged.
 
 ## [0.7.0] - 2026-08-08

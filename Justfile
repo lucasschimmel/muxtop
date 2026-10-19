@@ -55,3 +55,7 @@ bench-alloc:
 # Prepare a release (requires cargo-release)
 release version:
     cargo release {{version}}
+
+# Native PTY lifecycle (Linux/macOS; Python standard library only)
+test-exec-pty:
+    cargo test -p muxtop-tui --lib --no-run --locked --message-format=json | python3 scripts/test-exec-pty.py --cargo-json

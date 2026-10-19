@@ -74,7 +74,7 @@ newtype whose `Debug` implementation prints `Token("[REDACTED]")`, so a
 `tracing::debug!`, a panic message or a `format!("{:?}", cli)` cannot spill it.
 
 **Host-mutating actions are refused remotely.** Kill, force-kill, renice and the
-container stop/kill/restart actions are local-only. `muxtop --remote` is a
+container stop/kill/restart/shell actions are local-only. `muxtop --remote` is a
 viewer, so a compromised client cannot use the server as a remote-execution
 proxy.
 
@@ -87,7 +87,7 @@ field, a pod name and a network interface name are all **attacker-controlled**,
 and a terminal is an interpreter. A process named
 `$'\e]0;owned\a'` would rewrite your window title; worse sequences exist.
 
-So every externally-sourced string passes through `scrub_ctrl`
+So every externally-sourced monitoring string passes through `scrub_ctrl`
 (`crates/muxtop-tui/src/ui/sanitize.rs`) before it reaches a cell:
 
 - Replaced with `?`: every ASCII control byte — `0x00`–`0x08`, `0x0a`–`0x1f`
@@ -97,6 +97,13 @@ So every externally-sourced string passes through `scrub_ctrl`
 
 A `?` where you expected a character is muxtop telling you the source string
 contained a control byte.
+
+An explicitly opened **interactive container shell** is a separate terminal
+attachment. Its output intentionally includes raw escape sequences, as with
+`docker exec -it`; it does not have the table sanitizer's protection. It uses the
+same daemon connection, the container's default user and working directory, and
+never requests privileged exec. Detach closes the transport and does not promise
+to terminate the remote process. Exec never traverses muxtop's monitoring wire.
 
 ### 4. You → the host
 
@@ -108,7 +115,7 @@ The attacker is a mistake.
   to negative, and `kill(-1, sig)` signals every process the caller can reach;
   `kill(0, sig)` hits the caller's own process group. Both are rejected up
   front, on every platform, and both are covered by tests.
-- **Actions are confirmed.** Kill, force-kill and the container actions show a
+- **Actions are confirmed.** Kill, force-kill and container stop/kill/restart show a
   dialog naming the target first.
 - **Tab-scoped keys don't leak across tabs.** `F9` on the Network tab does
   nothing rather than killing the process selected on a tab you cannot see.

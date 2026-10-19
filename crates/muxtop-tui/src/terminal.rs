@@ -284,6 +284,66 @@ impl TerminalGuard {
     pub fn mouse_enabled(&self) -> bool {
         self.mouse_enabled
     }
+
+    /// Give the shell the normal screen while keeping raw input (Ctrl+C must
+    /// reach its PTY, not signal muxtop). Resume even when the session fails.
+    #[cfg(unix)]
+    pub(crate) fn with_shell<R>(&mut self, session: impl FnOnce() -> R) -> Result<R, TuiError> {
+        use crossterm::event::{DisableBracketedPaste, DisableFocusChange};
+        use crossterm::style::{Attribute, ResetColor, SetAttribute};
+        discard_pending_input()?;
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            cursor::Show
+        )?;
+        let result = session();
+        discard_pending_input()?;
+        // The shell may have changed emulator modes or entered its own alternate
+        // screen. Reset those modes before ratatui redraws the complete frame.
+        enable_raw_mode()?;
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            DisableFocusChange,
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            LeaveAlternateScreen,
+            EnterAlternateScreen,
+            cursor::Hide
+        )?;
+        if self.mouse_enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)?;
+        }
+        self.terminal.autoresize()?;
+        self.terminal.clear()?;
+        Ok(result)
+    }
+}
+
+/// A key read can prefetch a burst into crossterm's parser. At a terminal-owner
+/// boundary, discard complete queued events as well as kernel typeahead: shell
+/// input must never be replayed as TUI actions. Users wait for the shell prompt.
+#[cfg(unix)]
+fn discard_pending_input() -> Result<(), TuiError> {
+    use std::os::fd::AsRawFd;
+    let tty = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
+    // SAFETY: tty owns a live terminal fd; TCIFLUSH only discards pending input.
+    if unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+        return Err(TuiError::Terminal(io::Error::last_os_error()));
+    }
+    const MAX_QUEUED_EVENTS: usize = 4096;
+    for _ in 0..MAX_QUEUED_EVENTS {
+        if !crossterm::event::poll(std::time::Duration::ZERO)? {
+            return Ok(());
+        }
+        let _ = crossterm::event::read()?;
+    }
+    Err(TuiError::Terminal(io::Error::other(
+        "terminal input did not settle during shell handoff",
+    )))
 }
 
 impl Drop for TerminalGuard {

@@ -72,6 +72,7 @@ cargo build --release
 | **Containers tab** | Docker/Podman via [bollard](https://github.com/fussybeaver/bollard) — CPU/memory/network/IO table, CPU+RX sparklines, `F9` stop / `F10` kill / `F11` restart actions, automatic socket detection |
 | **Kubernetes tab** | Read-only Pods / Nodes / Deployments via [kube-rs](https://github.com/kube-rs/kube) — switch sub-views with `P` / `N` / `D`, sort with `s`, filter with `/`. Auto-detects `$KUBECONFIG` / `~/.kube/config` / in-cluster ServiceAccount; graceful fallback when `metrics-server` is absent (CPU/MEM render `—`). Lists cluster-wide by default; `--kube-namespace <NS>` scopes Pods and Deployments to one namespace so a namespace-bound Role is enough, and `A` toggles between the two at runtime (see [Kubernetes permissions](#kubernetes-permissions)) |
 | **GPU tab** | Read-only NVIDIA (via NVML) and AMD (via `amdgpu` sysfs) — utilisation, VRAM, temperature, power, clocks, fan, NVENC/NVDEC. Switch sub-views with `D` / `P`, sort with `s`, filter with `/`. Multiple vendors are merged into one list, and any metric a driver cannot report renders `—` rather than a misleading `0` (see [GPU support](#gpu-support)) |
+| **Container shell** | `e` on a running container opens `/bin/sh` with a PTY through the existing daemon, without a Docker CLI. Linux/macOS, local only; `Ctrl+]` detaches, `exit` returns |
 | **Command palette** | `Ctrl+P` fuzzy, `:` typed — `kill firefox`, `sort memory`, `stop nginx`, `restart postgres`, etc. |
 | **Help screen** | `?` — generated from the keymap, so it always matches the bindings |
 | **Inspector** | `Enter` on any row: full command line, image, pod node, GPU clocks, interface errors |
@@ -267,6 +268,7 @@ itself, so it cannot drift from what the keys actually do. The table below is th
 | `F9` | Kill process, SIGTERM (Processes) · Stop container (Containers) |
 | `F10` | Force kill, SIGKILL (Processes) · Kill container (Containers) |
 | `F11` | Restart container (Containers) |
+| `e` | Open container shell with PTY (Containers, Linux/macOS, local mode) |
 | `P` / `N` / `D` · `[` / `]` | Switch Kube sub-view to **P**ods / **N**odes / **D**eployments |
 | `A` | Toggle namespace scope — one namespace ↔ **A**ll namespaces (Kubernetes tab, local mode) |
 | `D` / `P` · `[` / `]` | Switch GPU sub-view to **D**evices / **P**rocs (GPU tab only) |
@@ -378,7 +380,7 @@ muxtop/
 ## Development
 
 ```sh
-just check    # fmt + clippy + tests
+just check    # fmt + clippy + deny + tests
 just bench    # criterion micro-benchmarks
 just dev      # continuous check with bacon
 ```
@@ -397,7 +399,7 @@ just dev      # continuous check with bacon
 | **v0.5** ✓ | GPU tab — NVIDIA via NVML, AMD via `amdgpu` sysfs, per-process usage, graceful per-metric degradation |
 | **v0.6** ✓ | Security and performance hardening — bounded rate limiter, shared cluster snapshots, cached Kube view, narrowed process collection |
 | **v0.7** ✓ | Apple Silicon GPU support — IOKit `IOAccelerator` + `IOReport`, unprivileged, unified-memory reporting |
-| v0.8 | Optimisation pass — binary size, resident memory, allocation profile — plus interactive `docker exec` (PTY) |
+| **v0.8** ✓ | Reliability and performance hardening, kube 4 migration, allocation/binary optimisation and interactive container exec with PTY (local Linux/macOS) |
 | v1.0 | WASM plugin system + themes + configuration file |
 
 ---
@@ -413,7 +415,7 @@ If you observe outbound activity from muxtop that isn't tied to a feature you've
 
 When the Kubernetes or Containers tab is active, muxtop only **reads** from the corresponding API:
 - Kubernetes : `LIST` on Pods / Nodes / Deployments + `GET` on `metrics.k8s.io/v1beta1`, scoped to one namespace or cluster-wide per [Kubernetes permissions](#kubernetes-permissions). No `CREATE` / `UPDATE` / `DELETE` / `PATCH` is ever issued. Write actions (Delete pod, Scale deployment, Rollout restart) are explicitly out of scope for v0.4.
-- Containers : `GET /containers/json` + `/stats?stream=false`. The Stop / Kill / Restart actions are gated behind a confirmation dialog and are local-only — disabled in `--remote` mode.
+- Containers : `GET /containers/json` + `/stats?stream=false`. The Stop / Kill / Restart actions are gated behind a confirmation dialog and are local-only — disabled in `--remote` mode. Interactive exec is also local-only: `e` explicitly opens `/bin/sh` in a running container using its default user, with direct PTY output. See [Containers](docs/wiki/Containers.md).
 - GPU : NVML query calls and reads of `/sys/class/drm/card*/device`. Both are read-only by construction — muxtop never sets a clock, a power limit or a fan curve, and the GPU tab has no actions at all. `--no-gpu` skips the probe entirely.
 
 ### Remote mode and credentials
