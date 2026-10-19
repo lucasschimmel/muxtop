@@ -10,7 +10,7 @@ panic = "abort"
 
 [workspace.package]
 edition = "2024"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Lucas Schimmel"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lucasschimmel/muxtop"
@@ -75,7 +75,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 bincode = "2"
 
 # Async trait (dyn-safe async fn in trait — see ADR-01 in forge/24)
-async-trait = "0.1"
+async-trait = "0.1.92"
 
 # Docker/Podman API client (v0.3 Containers, see ADR-01 in forge/25)
 bollard = "0.21"
@@ -85,9 +85,16 @@ futures = "0.3"
 # trimmed to keep binary footprint controlled (see plan T-810/T-820).
 # k8s-openapi forbids library crates from enabling its v1_* features; only
 # the leaf binaries (muxtop, muxtop-server) and the muxtop-core dev-deps
-# enable `v1_31`. The library lines below intentionally carry no features.
-kube = { version = "0.99", default-features = false, features = ["client", "rustls-tls", "runtime"] }
-k8s-openapi = { version = "0.24" }
+# enable `v1_32`. The library lines below intentionally carry no features.
+#
+# `ring` is listed explicitly because `default-features = false` drops it:
+# kube 4's defaults are `client, rustls-tls, ring`, so turning
+# defaults off to trim the feature set also silently deselected the crypto
+# provider — see the `tokio-rustls` note below for what filled the gap.
+# Stay on kube 4.0.x: 4.2 requires Rust 1.89, above our MSRV.
+# No runtime feature: this engine polls directly via Api, without reflectors.
+kube = { version = "~4.0.0", default-features = false, features = ["client", "ring", "rustls-tls"] }
+k8s-openapi = { version = "0.28" }
 
 # HTTP types — used by KubeEngine metrics polling (request_text); already a
 # transitive dep via kube-client, declared explicitly here for clarity.
@@ -97,15 +104,25 @@ http = "1"
 serde_json = "1"
 
 # TLS
-tokio-rustls = "0.26"
+#
+# The crypto provider is pinned to `ring`, and `default-features = false` is
+# what pins it: tokio-rustls 0.26's defaults are `logging, tls12, aws_lc_rs`,
+# and `aws_lc_rs` forwards to `rustls/aws_lc_rs`. Because Cargo unifies
+# features across the graph, that one default put aws-lc-rs into the same
+# `rustls` that kube-client and hyper-rustls share — 927 KiB of C and assembly,
+# including ML-DSA and ML-KEM code no muxtop handshake can reach. Nothing in
+# this workspace ever asked for it. Selecting `ring` here and on `kube` above
+# takes 1.375 MiB off the release binary (8.03 -> 6.66 MiB) and drops
+# aws-lc-sys from the graph entirely, at the cost of post-quantum key exchange.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls-pki-types = "1"
 rcgen = "0.14"
 ring = "0.17"
 
 # Internal crates
-muxtop-core = { path = "crates/muxtop-core", version = "0.7.0" }
-muxtop-tui = { path = "crates/muxtop-tui", version = "0.7.0" }
-muxtop-proto = { path = "crates/muxtop-proto", version = "0.7.0" }
+muxtop-core = { path = "crates/muxtop-core", version = "0.8.0" }
+muxtop-tui = { path = "crates/muxtop-tui", version = "0.8.0" }
+muxtop-proto = { path = "crates/muxtop-proto", version = "0.8.0" }
 
 [package]
 name = "muxtop"
@@ -145,8 +162,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 dirs = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-# k8s-openapi v1_31 feature is enabled here (binary leaf) so muxtop-core's
+# k8s-openapi v1_32 feature is enabled here (binary leaf) so muxtop-core's
 # typed Pod/Node/Deployment imports resolve. See workspace dep.
-k8s-openapi = { workspace = true, features = ["v1_31"] }
+k8s-openapi = { workspace = true, features = ["v1_32"] }

@@ -295,30 +295,45 @@ Everything the mouse can do, the keyboard can do. Overrides: `--theme <name>` (`
 
 ## Benchmarks
 
-Measured on a MacBook Air M3 (8 GB, macOS 26.5.1) with ~450 processes, via the
-Thomas benchmark. These are v0.7.0 figures: the numbers that stood here before
-were measured at **v0.3.1** and had gone four releases without being re-run, so
-they described a binary nobody was downloading any more.
+Measured on 2026-10-19 with Rust 1.95.0 on a MacBook Air M3 (8 GB,
+macOS 26.6.2), with ~500 processes, via the Thomas benchmark. Timings and
+memory figures are medians of five runs with their observed ranges beside them — a single sample of peak memory varies by more than a megabyte
+depending on how many processes are alive on the host.
 
-| Metric | Target | muxtop v0.7.0 |
-|----------|-------|--------|
-| Startup (`--about`) | < 100 ms | **12 ms** |
-| Binary size | < 10 MB | **8.0 MiB** (LTO + strip) |
-| FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) |
-| Peak RSS (30 s) | < 15 MiB | **12.4 MiB** — 9.9 MiB with `--no-gpu` |
+| Metric | Target | muxtop v0.8 | was (v0.7.0) |
+|----------|-------|--------|--------|
+| Startup (`--about`) | < 100 ms | **5.85 ms** (5.70–7.63) | 5.67 ms |
+| Binary size | < 10 MiB | **7.97 MiB** (LTO + strip) | 8.03 MiB |
+| FPS (TUI) | > 30 | ~60 (event-driven, idle ≈ 0 redraws) | — |
+| Peak RSS (30 s) | < 15 MiB | **12.98 MiB** (12.12–13.05) | 12.55 MiB |
+| Peak footprint (30 s) | — | **6.56 MiB** (6.34–6.72) | 5.77 MiB |
 
-Both numbers that moved are attributed rather than guessed at:
+**Two memory numbers, because macOS reports two.** Peak RSS is what `top`
+shows, and it counts clean, shared, file-backed pages of the dyld shared cache
+— the text of every system library the process touched, shared with everything
+else running and never written. Physical footprint is what the kernel actually
+bills the process. An earlier sample read 12.56 MiB and 5.66 MiB. RSS is the
+number comparable with htop (≈ 15) and btop (≈ 40); footprint is the half
+muxtop can actually reduce. Both are published. The headless macro does not
+measure interactive FPS; the FPS row describes the nominal event-driven rendering cadence.
 
-- **The GPU tab is the entire memory difference.** The Apple Silicon backend
-  costs ~2.4 MiB resident. The dependency bumps since v0.6.0 cost nothing
-  measurable — v0.7.0 with `--no-gpu` lands on v0.6.0 to within run-to-run
-  noise, on the same machine.
-- **Binary size has been near 8 MiB since v0.4** brought in a Kubernetes
-  client. v0.7.0 added 49 KiB to it. The 5.3 MiB figure predates that tab.
+**The v0.7.0 column is a historical remeasurement** on macOS 26.5.1 with
+~430 processes. The original v0.7.0 figures used a single-spawn stopwatch;
+the replacement harness amortises timing overhead over 200 execs per window.
+The OS, dependency graph and host load differ between columns, so these are
+release observations rather than a controlled A/B comparison.
 
-Both are targets for **v0.8**, which is an optimisation release rather than a
-feature one. Restating a budget you have drifted past is not the same as meeting
-it, and this table is where the drift became visible.
+**The earlier, isolated crypto-provider change saved 1.375 MiB** before the
+kube migration (8.03 to 6.66 MiB). rustls 0.23
+defaults to the `aws-lc-rs` crypto provider, and `default-features = false` on
+`kube` deselected the `ring` it would otherwise have used, so the binary
+carried 927 KiB of C and assembly — ML-DSA and ML-KEM among it — that no
+muxtop handshake can reach. Pinning `ring` explicitly drops `aws-lc-sys` from
+the dependency graph entirely. It costs post-quantum key exchange, which for a
+channel carrying system metrics with a lifetime of seconds is a trade this
+project is willing to make. The final 7.97 MiB binary meets the public budget
+but exceeds the unchanged 7 MiB contributor ceiling; that remains release
+review debt.
 
 Run the benchmark yourself:
 
@@ -366,7 +381,7 @@ muxtop/
 ## Development
 
 ```sh
-just check    # fmt + clippy + tests
+just check    # fmt + clippy + deny + tests
 just bench    # criterion micro-benchmarks
 just dev      # continuous check with bacon
 ```
@@ -385,7 +400,8 @@ just dev      # continuous check with bacon
 | **v0.5** ✓ | GPU tab — NVIDIA via NVML, AMD via `amdgpu` sysfs, per-process usage, graceful per-metric degradation |
 | **v0.6** ✓ | Security and performance hardening — bounded rate limiter, shared cluster snapshots, cached Kube view, narrowed process collection |
 | **v0.7** ✓ | Apple Silicon GPU support — IOKit `IOAccelerator` + `IOReport`, unprivileged, unified-memory reporting |
-| v0.8 | Optimisation pass — binary size, resident memory, allocation profile — plus interactive `docker exec` (PTY) |
+| **v0.8** ✓ | Reliability and performance hardening — collector freshness, TUI selection, remote recovery, bounded logs, kube 4 migration and allocation/binary optimisation |
+| Future | Interactive `docker exec` (PTY) |
 | v1.0 | WASM plugin system + themes + configuration file |
 
 ---

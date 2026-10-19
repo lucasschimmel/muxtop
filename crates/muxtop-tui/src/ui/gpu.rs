@@ -181,19 +181,51 @@ fn draw_subtabs(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &GpusSnapsh
 // Devices
 // ---------------------------------------------------------------------------
 
+pub(crate) fn device_matches_filter(d: &GpuDeviceSnapshot, filter: &str) -> bool {
+    filter.is_empty()
+        || d.name.to_lowercase().contains(filter)
+        || d.vendor.label().to_lowercase().contains(filter)
+}
+
+pub(crate) fn process_matches_filter(p: &GpuProcessSnapshot, filter: &str) -> bool {
+    filter.is_empty()
+        || p.name.to_lowercase().contains(filter)
+        || p.pid.to_string().contains(filter)
+}
+
+/// Shared projection for rendering, bounds, inspection and clipboard identity.
+pub(crate) fn visible_devices(app: &crate::app::AppState) -> Vec<&GpuDeviceSnapshot> {
+    let Some(snap) = app.last_snapshot.as_ref().and_then(|s| s.gpu.as_ref()) else {
+        return Vec::new();
+    };
+    let f = app.gpu_filter_input.to_lowercase();
+    let mut rows: Vec<_> = snap
+        .devices
+        .iter()
+        .filter(|d| device_matches_filter(d, &f))
+        .collect();
+    sort_devices(&mut rows, app.gpu_sort_field, app.gpu_sort_order);
+    rows
+}
+
+pub(crate) fn visible_procs(app: &crate::app::AppState) -> Vec<&GpuProcessSnapshot> {
+    let Some(snap) = app.last_snapshot.as_ref().and_then(|s| s.gpu.as_ref()) else {
+        return Vec::new();
+    };
+    let f = app.gpu_filter_input.to_lowercase();
+    let mut rows: Vec<_> = snap
+        .processes
+        .iter()
+        .filter(|p| process_matches_filter(p, &f))
+        .collect();
+    sort_procs(&mut rows, app.gpu_sort_field, app.gpu_sort_order);
+    rows
+}
+
 fn draw_devices(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &GpusSnapshot) {
     let app = r.app;
     let f = app.gpu_filter_input.to_lowercase();
-    let mut devices: Vec<&GpuDeviceSnapshot> = snap
-        .devices
-        .iter()
-        .filter(|d| {
-            f.is_empty()
-                || d.name.to_lowercase().contains(&f)
-                || vendor_label(d.vendor).to_lowercase().contains(&f)
-        })
-        .collect();
-    sort_devices(&mut devices, app.gpu_sort_field, app.gpu_sort_order);
+    let devices = visible_devices(app);
 
     let columns = device_columns(snap);
     let spec = Spec {
@@ -388,12 +420,7 @@ fn draw_procs(frame: &mut Frame, area: Rect, r: &Render<'_>, snap: &GpusSnapshot
     }
 
     let f = app.gpu_filter_input.to_lowercase();
-    let mut procs: Vec<&GpuProcessSnapshot> = snap
-        .processes
-        .iter()
-        .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f))
-        .collect();
-    sort_procs(&mut procs, app.gpu_sort_field, app.gpu_sort_order);
+    let procs = visible_procs(app);
 
     let spec = Spec {
         columns: PROC_COLUMNS,

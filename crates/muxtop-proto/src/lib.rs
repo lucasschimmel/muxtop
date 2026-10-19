@@ -1,5 +1,6 @@
 pub mod error;
 pub mod frame;
+pub mod logging;
 pub mod remote;
 pub mod tls;
 pub mod wire;
@@ -9,7 +10,7 @@ pub use frame::{
     Frame, FrameReader, FrameWriter, MAX_FRAME_SIZE, MSG_ERROR, MSG_HEARTBEAT, MSG_HELLO,
     MSG_SNAPSHOT, MSG_WELCOME, decode_frame, encode_frame,
 };
-pub use remote::{ConnectionEvent, RemoteCollector};
+pub use remote::{ConnectionEvent, RemoteCollector, RemoteUpdate};
 pub use tls::{RemoteTargetError, parse_remote_target};
 pub use wire::WireMessage;
 

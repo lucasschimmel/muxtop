@@ -53,9 +53,35 @@ pub(crate) struct ResourceCache {
     pub pods: Vec<Pod>,
     pub nodes: Vec<Node>,
     pub deployments: Vec<Deployment>,
-    /// Milliseconds since Unix epoch when the cache was last written.
-    /// Used to derive the [`ClusterError::Stale`] threshold.
+    /// Last successful list, in Unix milliseconds. Production expiry uses
+    /// the monotonic `last_success` clock to tolerate system clock changes.
     pub last_update_ms: u64,
+    poll_state: Option<ResourcePollState>,
+    last_success: Option<tokio::time::Instant>,
+}
+
+/// Retains the distinction between a fully healthy API, restricted/partial
+/// access and total failure without changing the serialized snapshot schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourcePollState {
+    Complete,
+    Partial,
+    Failed,
+}
+
+#[derive(Clone)]
+struct ScopeState {
+    scope: KubeScope,
+    generation: u64,
+}
+
+impl ScopeState {
+    fn new(scope: KubeScope) -> Self {
+        Self {
+            scope,
+            generation: 0,
+        }
+    }
 }
 
 /// Metrics-server cache — populated by the metrics polling task.
@@ -78,7 +104,7 @@ pub(crate) struct MetricsCache {
 /// `kube-rs`-backed [`ClusterEngine`].
 ///
 /// Construction goes through [`KubeEngine::connect`] for production paths
-/// (S2.6, future commit) or `KubeEngine::new_for_test` for unit tests
+/// or `KubeEngine::new_for_test` for unit tests
 /// that prepopulate the caches by hand.
 pub struct KubeEngine {
     cluster_kind: ClusterKind,
@@ -90,7 +116,7 @@ pub struct KubeEngine {
     scoped_namespace: String,
     /// Live scope shared with both poll loops — [`ClusterEngine::toggle_scope`]
     /// writes it and the next tick reads it.
-    scope: Arc<RwLock<KubeScope>>,
+    scope: Arc<RwLock<ScopeState>>,
     resources: Arc<RwLock<ResourceCache>>,
     metrics: Arc<RwLock<MetricsCache>>,
     /// Cancels the spawned poll task on drop.
@@ -160,7 +186,7 @@ impl KubeEngine {
         let scoped_namespace = namespace
             .map(String::from)
             .unwrap_or_else(|| resolved_namespace.clone());
-        let scope = Arc::new(RwLock::new(initial_scope));
+        let scope = Arc::new(RwLock::new(ScopeState::new(initial_scope)));
 
         // Resource poll task.
         let _resource_handle = spawn_resource_loop(
@@ -195,10 +221,18 @@ impl KubeEngine {
     /// Clears the pod and deployment caches so a scope-down never leaves
     /// out-of-scope rows on screen until the next poll tick.
     pub async fn set_scope(&self, scope: KubeScope) {
-        *self.scope.write().await = scope;
+        // Hold the scope write lock through cache invalidation. Publishers
+        // hold its read lock through publication, closing the check/write race.
+        let mut current = self.scope.write().await;
+        current.scope = scope;
+        current.generation = current.generation.wrapping_add(1);
         let mut cache = self.resources.write().await;
         cache.pods.clear();
         cache.deployments.clear();
+        cache.last_update_ms = 0;
+        cache.last_success = None;
+        cache.poll_state = None;
+        *self.metrics.write().await = MetricsCache::default();
     }
 
     /// Test constructor that bypasses the network entirely. The caches are
@@ -208,7 +242,7 @@ impl KubeEngine {
     /// `pub(crate)` because [`ResourceCache`] / [`MetricsCache`] are
     /// implementation details — never exposed to consumers of muxtop-core.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by the in-module tests; will be used by collector tests in E4
+    #[cfg(test)]
     /// `current_namespace` is interpreted the same way the wire field is: an
     /// empty string means cluster-wide, anything else scopes to that
     /// namespace.
@@ -233,7 +267,7 @@ impl KubeEngine {
             cluster_kind,
             server_version,
             scoped_namespace,
-            scope: Arc::new(RwLock::new(scope)),
+            scope: Arc::new(RwLock::new(ScopeState::new(scope))),
             resources: Arc::new(RwLock::new(resources)),
             metrics: Arc::new(RwLock::new(metrics)),
             cancel: CancellationToken::new(),
@@ -285,10 +319,22 @@ impl Drop for KubeEngine {
 #[async_trait]
 impl ClusterEngine for KubeEngine {
     async fn snapshot(&self) -> Result<KubeSnapshot, ClusterError> {
+        let scope = self.scope.read().await;
         let resources = self.resources.read().await;
         let metrics = self.metrics.read().await;
 
         let now_ms = unix_ms();
+        let age = resources
+            .last_success
+            .map(|last| last.elapsed())
+            .unwrap_or_else(|| {
+                Duration::from_millis(now_ms.saturating_sub(resources.last_update_ms))
+            });
+        if resources.last_update_ms > 0 && age > POLL_INTERVAL * 3 {
+            return Err(ClusterError::Stale {
+                since_secs: age.as_secs(),
+            });
+        }
         let pods: Vec<PodSnapshot> = resources
             .pods
             .iter()
@@ -312,14 +358,15 @@ impl ClusterEngine for KubeEngine {
             .map(|d| deployment_to_snapshot(d, now_ms))
             .collect();
 
-        // `reachable` is true iff at least one resource list has been
-        // populated by the poll loop (i.e. last_update_ms is non-zero).
-        let reachable = resources.last_update_ms > 0;
+        // Partial RBAC access remains usable; a fully failed poll must not
+        // advertise the previous successful cache as a live connection.
+        let reachable =
+            resources.last_update_ms > 0 && resources.poll_state != Some(ResourcePollState::Failed);
 
         Ok(KubeSnapshot {
             cluster_kind: self.cluster_kind,
             server_version: self.server_version.clone(),
-            current_namespace: self.scope.read().await.label().to_string(),
+            current_namespace: scope.scope.label().to_string(),
             reachable,
             metrics_available: metrics.available,
             pods,
@@ -341,11 +388,11 @@ impl ClusterEngine for KubeEngine {
     }
 
     async fn scope(&self) -> KubeScope {
-        self.scope.read().await.clone()
+        self.scope.read().await.scope.clone()
     }
 
     async fn toggle_scope(&self) -> KubeScope {
-        let next = match &*self.scope.read().await {
+        let next = match &self.scope.read().await.scope {
             KubeScope::AllNamespaces => KubeScope::Namespace(self.scoped_namespace.clone()),
             KubeScope::Namespace(_) => KubeScope::AllNamespaces,
         };
@@ -702,9 +749,8 @@ fn creation_age_seconds(
     creation: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
     now_ms: u64,
 ) -> u64 {
-    use k8s_openapi::chrono::Utc;
     let Some(t) = creation else { return 0 };
-    let created_ms = t.0.with_timezone(&Utc).timestamp_millis();
+    let created_ms = t.0.as_millisecond();
     if created_ms <= 0 {
         return 0;
     }
@@ -722,12 +768,28 @@ async fn build_config(
     context: Option<&str>,
     namespace: Option<&str>,
 ) -> Result<Config, ClusterError> {
-    match source {
+    let mut config = match source {
         KubeconfigSource::None => Err(ClusterError::KubeconfigNotFound),
-        KubeconfigSource::Env(path) | KubeconfigSource::Home(path) => {
-            let kc = Kubeconfig::read_from(&path).map_err(|e| {
-                ClusterError::Unreachable(format!("read kubeconfig {}: {e}", path.display()))
-            })?;
+        source @ (KubeconfigSource::Env(_) | KubeconfigSource::Home(_)) => {
+            let paths = match source {
+                KubeconfigSource::Env(path) => std::env::split_paths(path.as_os_str())
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .collect::<Vec<_>>(),
+                KubeconfigSource::Home(path) => vec![path],
+                _ => unreachable!("source was matched above"),
+            };
+            let kc = paths
+                .into_iter()
+                .try_fold(Kubeconfig::default(), |merged, path| {
+                    Kubeconfig::read_from(&path)
+                        .and_then(|next| merged.merge(next))
+                        .map_err(|error| {
+                            ClusterError::Unreachable(format!(
+                                "read kubeconfig {}: {error}",
+                                path.display()
+                            ))
+                        })
+                })?;
             let opts = KubeConfigOptions {
                 context: context.map(String::from),
                 cluster: None,
@@ -749,7 +811,11 @@ async fn build_config(
             }
             Ok(cfg)
         }
-    }
+    }?;
+    // Our poll loops own retry cadence and wrap each request in LIST_TIMEOUT.
+    // kube 4 otherwise retries transient statuses inside a single collection.
+    config.default_retry = false;
+    Ok(config)
 }
 
 /// Probe the API server's `/version` endpoint and derive a [`ClusterKind`]
@@ -783,12 +849,12 @@ async fn probe_version(client: &Client) -> Result<(ClusterKind, String), Cluster
 // ---- Resource poll loop -------------------------------------------------
 
 /// Spawn the 5 s loop that lists Pods / Nodes / Deployments. Per-resource
-/// failures are logged and the partial cache is preserved (RBAC graceful
-/// degradation — closes the v0.3 lesson on container_engine).
+/// failures are logged while successful kinds remain usable under restricted
+/// RBAC. Failed kinds are omitted instead of advertising old rows as live.
 fn spawn_resource_loop(
     client: Client,
     cache: Arc<RwLock<ResourceCache>>,
-    scope: Arc<RwLock<KubeScope>>,
+    scope: Arc<RwLock<ScopeState>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -817,7 +883,8 @@ fn spawn_resource_loop(
             // ticks. `Api::all` / `Api::namespaced` only wrap the shared
             // client in a request builder — no I/O, no handshake, so this is
             // cheaper than any change-detection scheme would be.
-            let (pod_api, deployment_api) = match scope.read().await.namespace() {
+            let current = scope.read().await.clone();
+            let (pod_api, deployment_api) = match current.scope.namespace() {
                 Some(ns) => (
                     Api::<Pod>::namespaced(client.clone(), ns),
                     Api::<Deployment>::namespaced(client.clone(), ns),
@@ -830,7 +897,7 @@ fn spawn_resource_loop(
 
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache) => {}
+                _ = tick_resources(&pod_api, &node_api, &deployment_api, &lp, &cache, &scope, current.generation) => {}
             }
         }
     })
@@ -838,9 +905,8 @@ fn spawn_resource_loop(
 
 /// List one resource kind, returning `None` on timeout or API error.
 ///
-/// `None` means "keep whatever the cache already holds" — per-resource
-/// failure must not wipe the other two (a namespace-only Role that 403s on
-/// nodes is the documented degraded mode, not a reason to blank the tab).
+/// `None` identifies an unavailable kind. A failure must not wipe the other
+/// two kinds: namespace-only RBAC commonly denies cluster-scoped Nodes.
 async fn list_or_warn<K>(api: &Api<K>, lp: &ListParams, kind: &'static str) -> Option<Vec<K>>
 where
     K: Clone + std::fmt::Debug + serde::de::DeserializeOwned,
@@ -864,6 +930,8 @@ async fn tick_resources(
     deployment_api: &Api<Deployment>,
     lp: &ListParams,
     cache: &Arc<RwLock<ResourceCache>>,
+    scope: &Arc<RwLock<ScopeState>>,
+    generation: u64,
 ) {
     // PERF-04: run the three lists concurrently. Sequentially they could
     // spend 3 x LIST_TIMEOUT = 9 s on a slow API server — longer than the
@@ -879,17 +947,31 @@ async fn tick_resources(
         list_or_warn(deployment_api, lp, "deployments"),
     );
 
+    let current = scope.read().await;
+    if current.generation != generation {
+        return;
+    }
+    let succeeded = usize::from(pods.is_some())
+        + usize::from(nodes.is_some())
+        + usize::from(deployments.is_some());
     let mut w = cache.write().await;
-    if let Some(p) = pods {
-        w.pods = p;
+    w.poll_state = Some(match succeeded {
+        0 => ResourcePollState::Failed,
+        3 => ResourcePollState::Complete,
+        _ => ResourcePollState::Partial,
+    });
+    if succeeded == 0 {
+        return;
     }
-    if let Some(n) = nodes {
-        w.nodes = n;
-    }
-    if let Some(d) = deployments {
-        w.deployments = d;
-    }
+    // Empty inaccessible kinds rather than retaining rows that look live.
+    w.pods = pods.unwrap_or_default();
+    w.nodes = nodes.unwrap_or_default();
+    w.deployments = deployments.unwrap_or_default();
     w.last_update_ms = unix_ms();
+    w.last_success = Some(tokio::time::Instant::now());
+    if succeeded < 3 {
+        tracing::debug!(target: "muxtop::kube", succeeded, "partial resource access; inaccessible lists omitted");
+    }
 }
 
 // ---- Metrics poll loop --------------------------------------------------
@@ -898,7 +980,7 @@ async fn tick_resources(
 fn spawn_metrics_loop(
     client: Client,
     cache: Arc<RwLock<MetricsCache>>,
-    scope: Arc<RwLock<KubeScope>>,
+    scope: Arc<RwLock<ScopeState>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -917,13 +999,19 @@ fn spawn_metrics_loop(
             let current = scope.read().await.clone();
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tick_metrics(&client, &cache, &current) => {}
+                _ = tick_metrics(&client, &cache, &current.scope, &scope, current.generation) => {}
             }
         }
     })
 }
 
-async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>, scope: &KubeScope) {
+async fn tick_metrics(
+    client: &Client,
+    cache: &Arc<RwLock<MetricsCache>>,
+    scope: &KubeScope,
+    live_scope: &Arc<RwLock<ScopeState>>,
+    generation: u64,
+) {
     // Pod metrics follow the resource scope: a namespace-only Role can read
     // `namespaces/{ns}/pods` but not the cluster-wide collection, so an
     // unscoped poll here would 403 and blank the CPU/MEM columns for exactly
@@ -943,6 +1031,11 @@ async fn tick_metrics(client: &Client, cache: &Arc<RwLock<MetricsCache>>, scope:
         fetch_metrics_text(client, &pod_path),
         fetch_metrics_text(client, "/apis/metrics.k8s.io/v1beta1/nodes"),
     );
+
+    let current = live_scope.read().await;
+    if current.generation != generation {
+        return;
+    }
 
     // Treat any error on either path as "metrics-server unavailable". This
     // matches what k9s does — the user just sees `—` in the CPU/MEM cols.
@@ -1129,7 +1222,6 @@ pub(crate) fn parse_metrics_cpu_to_millis(raw: &str) -> u32 {
 /// Heuristics are intentionally ASCII-cheap (substring match on the
 /// lowercased version string) — false positives are acceptable since
 /// `cluster_kind` only drives a UI badge.
-#[allow(dead_code)] // wired into KubeEngine::connect in S2.6; exercised by tests now.
 pub(crate) fn cluster_kind_from_git_version(git_version: &str) -> ClusterKind {
     let v = git_version.to_ascii_lowercase();
     if v.contains("eks") {
@@ -1242,7 +1334,8 @@ mod tests {
                 pods: vec![pod],
                 nodes: vec![node],
                 deployments: Vec::new(),
-                last_update_ms: 1,
+                last_update_ms: unix_ms(),
+                ..Default::default()
             },
             MetricsCache::default(),
         );
@@ -1799,7 +1892,8 @@ mod tests {
                 "metadata": {"name": "n1"},
                 "status": {"conditions": [{"type": "Ready", "status": "True"}]}
             }))],
-            last_update_ms: 1,
+            last_update_ms: unix_ms(),
+            ..Default::default()
         };
 
         let engine = KubeEngine::new_for_test(
@@ -1898,3 +1992,6 @@ mod tests {
         assert!(!snap.reachable);
     }
 }
+
+#[cfg(test)]
+mod regression_tests;

@@ -2,18 +2,18 @@
 //! source detection for Kubernetes clusters.
 //!
 //! This module defines the interface only. The concrete `kube-rs`-based
-//! implementation lives in `KubeEngine` (E2, not yet implemented).
+//! implementation lives in `KubeEngine`.
 //!
 //! Refresh rate contract: the Collector is expected to invoke
 //! [`ClusterEngine::snapshot`] at **0.2 Hz** (once every 5 s, see ADR-05).
-//! The real fetching cost is amortised by `kube_runtime` reflectors which
-//! maintain push-based caches; `snapshot()` reads from the in-memory store.
+//! Independent resource and metrics polling loops maintain caches;
+//! `snapshot()` reads from those in-memory stores without network I/O.
 //!
 //! # Detection chain
 //!
 //! [`detect_kubeconfig`] tries, in order:
-//! 1. `$KUBECONFIG` environment variable (path or `:`-separated list — kube-rs
-//!    handles the multiplex; we keep the raw value).
+//! 1. `$KUBECONFIG` environment variable (path or platform-separated list —
+//!    the engine splits and merges it; detection keeps the raw value).
 //! 2. `~/.kube/config` (typical user kubeconfig).
 //! 3. In-cluster ServiceAccount: existence of
 //!    `/var/run/secrets/kubernetes.io/serviceaccount/token`.
@@ -39,8 +39,8 @@ use crate::kube::{ClusterKind, KubeSnapshot};
 /// Granularity matches the v0.3 `EngineError` (cf. ADR-01) but adds two
 /// Kubernetes-specific variants: per-resource RBAC ([`Self::Forbidden`]) and
 /// metrics-server absence ([`Self::MetricsUnavailable`]). [`Self::Stale`]
-/// captures the case where the watcher reflector lost its event stream and
-/// the cached state is older than the freshness contract.
+/// captures the case where the polling cache has not received a successful
+/// resource list within the freshness contract.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ClusterError {
     /// No kubeconfig source could be resolved (no `$KUBECONFIG`, no
@@ -71,8 +71,7 @@ pub enum ClusterError {
     MetricsUnavailable,
 
     /// The cached snapshot is older than the freshness contract — the
-    /// watcher reflector likely lost its event stream and the relist hasn't
-    /// completed yet.
+    /// polling task has not completed a successful list in time.
     #[error("snapshot stale (last update {since_secs}s ago)")]
     Stale { since_secs: u64 },
 
@@ -89,7 +88,7 @@ pub enum ClusterError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KubeconfigSource {
     /// Path resolved from `$KUBECONFIG`. May be a single file or a
-    /// `:`-separated list — left raw, kube-rs unifies them.
+    /// platform-separated list — the engine splits and merges the files.
     Env(PathBuf),
     /// Default user kubeconfig at `~/.kube/config`.
     Home(PathBuf),
@@ -190,10 +189,10 @@ pub fn parse_namespace(raw: &str) -> Result<String, String> {
 /// (`Send + Sync + 'static`).
 ///
 /// See ADR-04 (`kube-rs vs k8s-openapi direct`): the production implementation
-/// `KubeEngine` (E2) wraps `kube::Client` + `kube_runtime::reflector::Store`s
-/// for Pod / Node / Deployment, plus a 5 s polling loop against
+/// `KubeEngine` wraps `kube::Client` and polling caches for Pod / Node /
+/// Deployment, plus a 5 s polling loop against
 /// `metrics.k8s.io/v1beta1`. `snapshot()` reads from the in-memory stores
-/// and is therefore CPU-only — the network cost is borne by the watchers.
+/// and is therefore CPU-only — the network cost is borne by the poll loops.
 ///
 /// See ADR-01 (v0.3): `#[async_trait]` is used to keep the trait object-safe;
 /// the Collector holds `Option<Arc<dyn ClusterEngine + Send + Sync>>`.

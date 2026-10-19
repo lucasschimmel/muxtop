@@ -6,23 +6,60 @@ aspirations — a feature that breaks one does not ship until it stops breaking 
 
 ## Published figures
 
-Measured on macOS with 500+ processes, via the repository's own benchmark:
+Measured for v0.8.0 on 2026-10-19 with Rust 1.95.0 on a MacBook Air M3
+(8 GB, macOS 26.6.2), with ~500 processes, via the repository's own benchmark.
+Timings and memory figures are medians of five runs, with ranges beside them:
 
 | Metric | Budget | Measured |
 |---|---|---|
-| Startup (`--about`) | < 100 ms | ~12 ms |
-| Binary size | < 10 MiB | **5.3 MiB** (LTO + strip) |
+| Startup (`--about`) | < 100 ms | **5.85 ms** (5.70–7.63) |
+| Binary size | < 10 MiB | **7.97 MiB** (LTO + strip) |
 | FPS (TUI) | > 30 | ~60, event-driven — idle ≈ 0 redraws |
-| Peak RSS (30 s) | < 15 MiB | **11.3 MiB** (htop ≈ 15, btop ≈ 40) |
+| Peak RSS (30 s) | < 15 MiB | **12.98 MiB** (12.12–13.05) |
+| Peak footprint (30 s) | — | **6.56 MiB** (6.34–6.72) |
 
 ```sh
-just bench-thomas       # macro: build, startup, RSS
+just bench-thomas       # macro: build, size, startup, RSS + footprint
 just bench              # criterion micro-benchmarks
 just bench-alloc        # dhat heap profile of the hot paths
 ```
 
+The headless macro does not measure interactive FPS; that row describes the
+nominal event-driven rendering cadence. RSS has only 0.02 MiB of median
+headroom against the contributor ceiling, with the highest sample at 13.05 MiB.
+
 Numbers move with hardware, process count and terminal. Reproduce them on your
 own box before comparing.
+
+### Why two memory numbers
+
+macOS reports two, and they differ by more than a factor of two, so publishing
+one alone means picking a story.
+
+**Peak RSS** is mach's `resident_size` — what `top` and Activity Monitor's
+older columns show. It counts clean, file-backed, *shared* pages of the dyld
+shared cache: the text of every system library the process touched, shared with
+every other process on the machine and never written by us. It is the only
+figure comparable with the htop and btop numbers above, which is why it stays.
+
+**Physical footprint** is `phys_footprint` — what the kernel actually charges
+the process, and roughly what muxtop would free if it exited. It is the half
+that responds to optimisation.
+
+A change that reduces code the process never pages in — most binary-size work —
+moves neither. A change that removes a per-tick allocation moves footprint and
+may leave RSS flat. Judging memory work on RSS alone therefore reports most
+real savings as zero, and reports loading one extra system framework as a
+multi-megabyte regression.
+
+**These figures were previously measured wrong, in both directions.** The table
+above stood at 5.3 MiB binary and 11.3 MiB RSS while describing v0.3.1, four
+releases after that binary stopped existing. The startup figure was worse than
+stale: the benchmark timed a single process spawn between two `date` calls,
+which on this machine cost 6–19 ms on their own, so it reported ~12 ms for a
+binary that starts in about 6. Roughly half the published number was the
+stopwatch. Both are fixed in `scripts/bench-thomas.sh`, which now amortises
+startup over many execs and prints its own measurement cost beside the result.
 
 ## Why it is cheap
 
@@ -47,7 +84,8 @@ freezes its own tab's data, not your keyboard.
 
 **The release profile is tuned for size and speed**: `lto = "fat"`,
 `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`. That is what turns a
-multi-megabyte debug build into a 5.3 MiB static binary.
+debug build into a stripped release binary; the current measured size is in
+the table above.
 
 ---
 
@@ -128,12 +166,35 @@ If you file a performance issue, the useful numbers are: process count
 
 Any change must keep:
 
-| | |
-|---|---|
-| Peak RSS (30 s) | < 13 MiB |
-| Binary size | < 7 MiB |
-| Startup (`--about`) | < 30 ms |
+| | Contributor ceiling | Published budget |
+|---|---|---|
+| Peak RSS (30 s) | **< 13 MiB** | < 15 MiB |
+| Binary size | **< 7 MiB** | < 10 MiB |
+| Startup (`--about`) | **< 30 ms** | < 100 ms |
+| Peak footprint (30 s) | tracked, not yet bounded | — |
 
-Those are tighter than the published budgets on purpose — they are the ceilings
-the current numbers are allowed to drift toward, not targets to grow into. A
-feature that needs more argues for itself in the pull request.
+**There are two tiers on purpose, and they are not in conflict.** The published
+budgets are the promise made to users in the README; the contributor ceilings
+are tighter, and they are the ones a pull request is held to. They exist so the
+published promise is never the thing under pressure — by the time a change
+threatens the user-facing number it has already had to argue with a stricter
+one. The issue templates quote the contributor tier because that is what a
+proposal has to clear. Neither figure has ever been lowered to accommodate a
+measurement.
+
+**The `< 7 MiB` binary ceiling was written before muxtop had a Kubernetes
+client, and was exceeded from v0.4 to v0.7.** It was kept rather than restated
+upward. The isolated crypto-provider optimization reached 6.66 MiB before
+the kube migration, but the final v0.8.0 release candidate measures **7.97 MiB**
+(8,355,168 bytes). It meets the public budget and exceeds the contributor
+ceiling by 0.97 MiB; release review must account for this outstanding debt.
+The ceiling remains unchanged.
+
+**Footprint is measured but not yet bounded.** v0.8 is the first release to
+report it, and one machine on one platform is not a baseline — a ceiling set
+from a single MacBook Air would bind Linux and Windows contributors to a number
+nobody measured there. It will be set once there are figures from all three CI
+platforms.
+
+A feature that needs more than any of these argues for itself in the pull
+request.
